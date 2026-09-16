@@ -1,0 +1,7 @@
+.env
+.env.testing
+__pycache__/
+*.pyc
+output/*.json
+output/*.xlsx
+page_snippet.txt
