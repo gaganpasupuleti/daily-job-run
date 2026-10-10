@@ -45,6 +45,7 @@ class ScrapeResult:
     finished_at: str
     json_path: str | None = None
     families: list[dict] = field(default_factory=list)
+    source_health: dict = field(default_factory=dict)
 
 
 def parse_sources(raw: str) -> tuple[bool, list[str], bool]:
@@ -102,6 +103,10 @@ def collect_jobs(
     per_family_counts: dict[str, int] = {}
     per_source_counts: Counter[str] = Counter()
     errors: list[str] = []
+    health = {
+        name: {"attempted": True, "calls": 0, "call_failures": 0, "errors": []}
+        for name in source_label
+    }
     naukri_client: NaukriSearchClient | None = None
     if want_naukri:
         naukri_client = NaukriSearchClient(delay_seconds=1.2)
@@ -111,6 +116,7 @@ def collect_jobs(
             fam_jobs: list[UnifiedJob] = []
             for keyword in family["keywords"]:
                 if naukri_client is not None:
+                    health["naukri"]["calls"] += 1
                     try:
                         n_jobs = naukri_client.search_jobs(
                             keyword,
@@ -127,7 +133,10 @@ def collect_jobs(
                             fam_jobs.append(uj)
                     except Exception as exc:
                         logger.exception("Naukri failed for %r", keyword)
-                        errors.append(f"naukri:{keyword}: {exc}")
+                        health["naukri"]["call_failures"] += 1
+                        message = f"naukri:{keyword}: {exc}"
+                        health["naukri"]["errors"].append(message)
+                        errors.append(message)
 
                 if jobspy_sites:
                     rows, _breakdown, site_errors = scrape_jobs_safe(
@@ -137,6 +146,14 @@ def collect_jobs(
                         sources=jobspy_sites,
                     )
                     errors.extend(site_errors)
+                    import_failure = any("python-jobspy" in err for err in site_errors)
+                    for site in jobspy_sites:
+                        row = health[site]
+                        row["calls"] += 1
+                        site_errors_for = [err for err in site_errors if err.lower().startswith(f"{site}:")]
+                        if import_failure or site_errors_for:
+                            row["call_failures"] += 1
+                            row["errors"].extend(site_errors_for or site_errors)
                     for row in rows:
                         uj = from_jobspy_row(
                             row,
@@ -156,6 +173,10 @@ def collect_jobs(
                         hours_old=hours_old,
                     )
                     errors.extend(f_errors)
+                    health["foundit"]["calls"] += 1
+                    if f_errors and not f_jobs:
+                        health["foundit"]["call_failures"] += 1
+                        health["foundit"]["errors"].extend(f_errors)
                     for uj in f_jobs:
                         uj.role_family = family["id"]
                         uj.role_family_name = family["name"]
@@ -172,6 +193,18 @@ def collect_jobs(
             naukri_client.close()
 
     deduped = dedupe_jobs(all_jobs)
+    returned: Counter[str] = Counter(job.source for job in deduped)
+    source_health = {}
+    for name, row in health.items():
+        calls = int(row["calls"])
+        failures = int(row["call_failures"])
+        source_health[name] = {
+            "attempted": True,
+            "succeeded": calls > 0 and failures < calls,
+            "failed": calls == 0 or failures == calls,
+            "jobs_returned": int(returned.get(name, 0)),
+            "errors": list(dict.fromkeys(row["errors"])),
+        }
     finished = datetime.now(timezone.utc)
     json_path = None
     if write_json:
@@ -202,6 +235,7 @@ def collect_jobs(
         finished_at=finished.isoformat(),
         json_path=json_path,
         families=families,
+        source_health=source_health,
     )
 
 

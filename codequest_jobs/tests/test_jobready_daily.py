@@ -120,6 +120,56 @@ class ContractTests(unittest.TestCase):
             sys.argv = previous
         self.assertIn("PRUNE_REFUSED", str(caught.exception))
 
+    def test_experience_buckets_use_the_jobready_vocabulary(self) -> None:
+        from jobready_catalog import catalog_experience_bucket
+
+        self.assertEqual(
+            catalog_experience_bucket(experience_level="fresher", title="Python Intern", job_type=""),
+            "Internship",
+        )
+        self.assertEqual(
+            catalog_experience_bucket(experience_level="fresher", title="Python Developer", job_type="fulltime"),
+            "Fresher",
+        )
+        self.assertEqual(
+            catalog_experience_bucket(experience_level="entry", title="Java Developer", job_type=""),
+            "Entry (1-2 yrs)",
+        )
+        self.assertEqual(
+            catalog_experience_bucket(experience_level="experienced", title="Data Engineer", job_type=""),
+            "Experienced",
+        )
+        self.assertEqual(
+            catalog_experience_bucket(experience_level="", title="Account Manager", job_type=""),
+            "Unknown / Unclassified",
+        )
+
+    def test_provider_rules_are_conservative(self) -> None:
+        from jobready_validator import interpret_indeed, interpret_linkedin, interpret_naukri
+
+        self.assertEqual(interpret_indeed(expired=True, key_configured=True)[0], "confirmed_expired")
+        self.assertEqual(interpret_indeed(expired=False, key_configured=True)[0], "confirmed_active")
+        self.assertEqual(interpret_indeed(expired=None, key_configured=False)[0], "inconclusive")
+        self.assertEqual(interpret_indeed(expired=None, key_configured=True)[0], "inconclusive")
+        closed = interpret_linkedin(status_code=200, body="No longer accepting applications")
+        self.assertEqual(closed, ("confirmed_expired", "linkedin_closed_marker"))
+        self.assertEqual(interpret_linkedin(status_code=404, body="")[0], "confirmed_expired")
+        self.assertEqual(interpret_linkedin(status_code=410, body="")[0], "confirmed_expired")
+        self.assertEqual(interpret_linkedin(status_code=429, body="")[0], "inconclusive")
+        self.assertEqual(interpret_linkedin(status_code=503, body="")[0], "inconclusive")
+        self.assertEqual(interpret_naukri(status_code=404, payload=None)[0], "inconclusive")
+        self.assertEqual(interpret_naukri(status_code=410, payload=None)[0], "inconclusive")
+        self.assertEqual(interpret_naukri(status_code=500, payload={"error": "system"})[0], "inconclusive")
+        self.assertEqual(interpret_naukri(status_code=200, payload={"job": []})[0], "inconclusive")
+        self.assertEqual(
+            interpret_naukri(status_code=200, payload={"job": {"title": "Python Developer", "jobStatus": "expired"}})[0],
+            "confirmed_expired",
+        )
+        self.assertEqual(
+            interpret_naukri(status_code=200, payload={"job": {"title": "Python Developer"}})[0],
+            "confirmed_active",
+        )
+
     def test_report_refuses_credentials(self) -> None:
         with self.assertRaises(SystemExit) as caught:
             daily.write_report({"started_at": "2026-10-10T00:00:00+00:00", "note": "postgresql://user:secret@host/db"})
@@ -350,6 +400,7 @@ class CatalogTests(unittest.TestCase):
                 self.assertEqual(cur.fetchone(), ("archived", False))
             self._run(
                 [_job(url)],
+                observations=[(job_id, "expired", "confirmed_active")],
                 app_conn=self.app,
                 apply_membership=True,
                 confirm_target=_confirm(APP_URL),
@@ -480,6 +531,7 @@ class CatalogTests(unittest.TestCase):
                 self.assertEqual(cur.fetchone(), ("archived", False))
             self._run(
                 [_job(url)],
+                observations=[(job_id, "expired", "confirmed_active")],
                 app_conn=self.app,
                 apply_membership=True,
                 confirm_target=_confirm(APP_URL),
@@ -502,6 +554,311 @@ class CatalogTests(unittest.TestCase):
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
+
+    def test_expired_search_hit_stays_expired_until_confirmed_active(self) -> None:
+        url = "https://example.test/jobs/stay-expired"
+        self._run([_job(url)])
+        job_id, _status, _created, synced, _updated, _source = self._row(url)
+        self._run([], observations=[(job_id, "active", "confirmed_expired")])
+        expired_row = self._row(url)
+        self.assertEqual(expired_row[1], "expired")
+        self.assertEqual(expired_row[3], synced)
+        self._run([_job(url)])
+        after_search = self._row(url)
+        self.assertEqual(after_search[1], "expired")
+        self.assertGreater(after_search[3], synced)
+        self.assertEqual(after_search[4], expired_row[4])
+        expired_updated = after_search[4]
+        app_id = str(uuid.uuid4())
+        with self.app.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO jobs (id, external_id, status, is_active, updated_at)
+                VALUES (%s, %s, 'active', true, NOW())
+                """,
+                (app_id, f"jobs-server:{job_id}"),
+            )
+        self.app.commit()
+        previous_app = os.environ.get("JOB_READY_APP_DATABASE_URL")
+        previous_catalog = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_APP_DATABASE_URL"] = APP_URL
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        try:
+            self._run(
+                [],
+                app_conn=self.app,
+                apply_membership=True,
+                confirm_target=_confirm(APP_URL),
+            )
+            with self.app.cursor() as cur:
+                cur.execute("SELECT status, is_active FROM jobs WHERE id = %s", (app_id,))
+                self.assertEqual(cur.fetchone(), ("archived", False))
+            self._run([_job(url)])
+            self.assertEqual(self._row(url)[1], "expired")
+            self._run(
+                [],
+                observations=[(job_id, "expired", "confirmed_active")],
+                app_conn=self.app,
+                apply_membership=True,
+                confirm_target=_confirm(APP_URL),
+            )
+        finally:
+            self._restore("JOB_READY_APP_DATABASE_URL", previous_app)
+            self._restore("JOB_READY_DATABASE_URL", previous_catalog)
+        self.assertEqual(self._row(url)[1], "active")
+        self.assertGreater(self._row(url)[4], expired_updated)
+        with self.app.cursor() as cur:
+            cur.execute("SELECT status, is_active FROM jobs WHERE id = %s", (app_id,))
+            self.assertEqual(cur.fetchone(), ("active", True))
+
+    def test_date_salary_and_enrichment_survive_a_thin_rescrape(self) -> None:
+        from datetime import datetime, timezone
+
+        url = "https://example.test/jobs/keep-fields"
+        posted = datetime(2026, 1, 15, 8, 30, tzinfo=timezone.utc)
+        rich = _job(url)
+        rich.date_posted = posted
+        rich.salary_min = 120000
+        rich.salary_max = 180000
+        rich.currency = "INR"
+        rich.description = (
+            "Build Python APIs with Django and PostgreSQL. "
+            "Requirements: python, django, sql. Responsibilities: design services."
+        )
+        self._run([rich])
+        with self.catalog.cursor() as cur:
+            cur.execute(
+                """
+                SELECT date_posted, salary_min, salary_max, currency, jd_clean, required_skills, experience_bucket
+                FROM validated_jobs WHERE job_url = %s
+                """,
+                (url,),
+            )
+            stored = cur.fetchone()
+        self.assertIsNotNone(stored[0])
+        self.assertEqual(stored[6], "Fresher")
+        thin = _job(url)
+        thin.description = ""
+        thin.date_posted = None
+        thin.salary_min = None
+        thin.salary_max = None
+        thin.currency = ""
+        self._run([thin])
+        with self.catalog.cursor() as cur:
+            cur.execute(
+                """
+                SELECT date_posted, salary_min, salary_max, currency, jd_clean, required_skills
+                FROM validated_jobs WHERE job_url = %s
+                """,
+                (url,),
+            )
+            again = cur.fetchone()
+        self.assertEqual(again[0], stored[0])
+        self.assertEqual(again[1], stored[1])
+        self.assertEqual(again[2], stored[2])
+        self.assertEqual(again[3], stored[3])
+        self.assertEqual(again[4], stored[4])
+        self.assertEqual(again[5], stored[5])
+
+    def test_validation_queue_rotates_by_oldest_check(self) -> None:
+        urls = [f"https://example.test/jobs/queue-{index}" for index in range(3)]
+        self._run([_job(url) for url in urls])
+        with self.catalog.cursor() as cur:
+            for index, url in enumerate(urls):
+                cur.execute(
+                    """
+                    UPDATE validated_jobs
+                    SET link_checked_at = NOW() - (%s || ' days')::interval,
+                        last_link_observation = 'confirmed_active:fixture'
+                    WHERE job_url = %s
+                    """,
+                    (3 - index, url),
+                )
+        self.catalog.commit()
+        first = catalog.select_validation_candidates(self.catalog, limit=1, priority_ids=[])
+        self.assertEqual(len(first), 1)
+        catalog.apply_link_observations(
+            self.catalog,
+            [(first[0]["job_id"], "active", "unknown")],
+        )
+        second = catalog.select_validation_candidates(self.catalog, limit=1, priority_ids=[])
+        self.assertNotEqual(second[0]["job_id"], first[0]["job_id"])
+
+    def test_validation_alone_does_not_move_synced_at(self) -> None:
+        url = "https://example.test/jobs/check-only"
+        self._run([_job(url)])
+        job_id, _status, _created, synced, updated, _source = self._row(url)
+        self._run([], observations=[(job_id, "active", "unknown")])
+        self.assertEqual(self._row(url)[3], synced)
+        self.assertEqual(self._row(url)[4], updated)
+        self.assertEqual(self._row(url)[1], "active")
+        self._run([], observations=[(job_id, "active", "confirmed_expired")])
+        self.assertEqual(self._row(url)[1], "expired")
+        self.assertEqual(self._row(url)[3], synced)
+
+    def test_source_wide_failure_does_not_change_membership(self) -> None:
+        url = "https://example.test/jobs/source-down"
+        self._run([_job(url)])
+        job_id = self._row(url)[0]
+        app_id = str(uuid.uuid4())
+        with self.app.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO jobs (id, external_id, status, is_active, updated_at)
+                VALUES (%s, %s, 'active', true, NOW())
+                """,
+                (app_id, f"jobs-server:{job_id}"),
+            )
+        self.app.commit()
+        previous_app = os.environ.get("JOB_READY_APP_DATABASE_URL")
+        previous_catalog = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_APP_DATABASE_URL"] = APP_URL
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        health = {
+            "naukri": {
+                "attempted": True,
+                "succeeded": False,
+                "failed": True,
+                "jobs_returned": 0,
+                "errors": ["naukri unavailable"],
+            }
+        }
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                self._run(
+                    [],
+                    app_conn=self.app,
+                    apply_membership=True,
+                    confirm_target=_confirm(APP_URL),
+                    sources_attempted=["naukri"],
+                    source_health=health,
+                )
+        finally:
+            self._restore("JOB_READY_APP_DATABASE_URL", previous_app)
+            self._restore("JOB_READY_DATABASE_URL", previous_catalog)
+        self.assertIn("source-wide failure", str(caught.exception))
+        self.assertEqual(self._row(url)[1], "active")
+        with self.app.cursor() as cur:
+            cur.execute("SELECT status, is_active FROM jobs WHERE id = %s", (app_id,))
+            self.assertEqual(cur.fetchone(), ("active", True))
+
+    def test_cli_path_validates_catalog_rows(self) -> None:
+        from run_all_sources import ScrapeResult
+
+        url = "https://example.test/jobs/cli"
+        health = {
+            "naukri": {
+                "attempted": True,
+                "succeeded": True,
+                "failed": False,
+                "jobs_returned": 1,
+                "errors": [],
+            }
+        }
+
+        def collect(**_kwargs):
+            return ScrapeResult(
+                jobs=[_job(url)],
+                per_source={"naukri": 1},
+                per_family={"python-dev": 1},
+                errors=[],
+                sources_attempted=["naukri"],
+                started_at="2026-10-10T00:00:00+00:00",
+                finished_at="2026-10-10T00:00:01+00:00",
+                source_health=health,
+            )
+
+        def probe(row):
+            return ("confirmed_active", "fixture_live", row.get("source") or "naukri")
+
+        previous = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        try:
+            args = daily.parse_args(["--sources", "naukri", "--validation-limit", "10"])
+            report = daily.execute_daily(args, collect=collect, probes={"naukri": probe, "generic": probe})
+        finally:
+            self._restore("JOB_READY_DATABASE_URL", previous)
+        self.reports.append(Path(report["report_path"]))
+        self.assertGreater(report["validated_checked"], 0)
+        self.assertEqual(report["confirmed_active"], 1)
+        self.assertEqual(self._row(url)[1], "active")
+        self.assertIn("naukri", report["sources_successful"])
+        self.assertNotIn("postgresql://", Path(report["report_path"]).read_text(encoding="utf-8").lower())
+
+    def test_mass_application_archive_is_refused(self) -> None:
+        previous_app = os.environ.get("JOB_READY_APP_DATABASE_URL")
+        previous_catalog = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_APP_DATABASE_URL"] = APP_URL
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        with self.app.cursor() as cur:
+            for index in range(100):
+                cur.execute(
+                    """
+                    INSERT INTO jobs (id, external_id, status, is_active, updated_at)
+                    VALUES (%s, %s, 'active', true, NOW())
+                    """,
+                    (str(uuid.uuid4()), f"jobs-server:CQJ-MASS-{index:04d}"),
+                )
+        self.app.commit()
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                sync.archive_ui_jobs_not_in_catalog(confirm_target=_confirm(APP_URL))
+        finally:
+            self._restore("JOB_READY_APP_DATABASE_URL", previous_app)
+            self._restore("JOB_READY_DATABASE_URL", previous_catalog)
+        self.assertIn("MEMBERSHIP_REFUSED", str(caught.exception))
+        with self.app.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM jobs WHERE status = 'active' AND is_active IS TRUE")
+            self.assertEqual(cur.fetchone()[0], 100)
+
+    def test_preflight_is_read_only(self) -> None:
+        url = "https://example.test/jobs/preflight"
+        self._run([_job(url)])
+        before_count = self._count()
+        before_updated = self._row(url)[4]
+        previous = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        try:
+            code = daily.run_preflight()
+        finally:
+            self._restore("JOB_READY_DATABASE_URL", previous)
+        self.assertEqual(code, 0)
+        self.assertEqual(self._count(), before_count)
+        self.assertEqual(self._row(url)[4], before_updated)
+        if CODEQUEST_SENTINEL:
+            os.environ["JOB_READY_DATABASE_URL"] = CODEQUEST_SENTINEL
+            try:
+                missing = daily.run_preflight()
+            finally:
+                self._restore("JOB_READY_DATABASE_URL", previous)
+            self.assertEqual(missing, 1)
+            self._assert_sentinel_empty(CODEQUEST_SENTINEL)
+
+    def test_schema_apply_refuses_duplicate_identities(self) -> None:
+        with self.catalog.cursor() as cur:
+            cur.execute("DROP INDEX IF EXISTS idx_validated_jobs_source_id_unique")
+            cur.execute(
+                """
+                INSERT INTO validated_jobs (job_id, source_id, source, title, job_url, link_status)
+                VALUES
+                  ('CQJ-20200101-0001', 'same-source', 'naukri', 'One', 'https://example.test/a', 'active'),
+                  ('CQJ-20200101-0002', 'same-source', 'naukri', 'Two', 'https://example.test/b', 'active')
+                """
+            )
+        self.catalog.commit()
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                catalog.apply_schema(self.catalog)
+            self.assertIn("SCHEMA_REFUSED", str(caught.exception))
+            self.assertEqual(self._count(), 2)
+            with self.catalog.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.idx_validated_jobs_source_id_unique')")
+                self.assertIsNone(cur.fetchone()[0])
+        finally:
+            with self.catalog.cursor() as cur:
+                cur.execute("DELETE FROM validated_jobs WHERE source_id = 'same-source'")
+            self.catalog.commit()
+            catalog.ensure_schema(self.catalog)
 
     def _assert_sentinel_empty(self, url: str) -> None:
         if not url:
