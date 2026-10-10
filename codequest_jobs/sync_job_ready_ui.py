@@ -156,6 +156,30 @@ def _count_membership(cur, keep_ids: list[str]) -> tuple[int, int]:
     return would_archive, int(cur.fetchone()[0])
 
 
+# A write is refused only when a set is large in both count and share of
+# integration-owned active application jobs. There is no bypass flag.
+MEMBERSHIP_ARCHIVE_ABSOLUTE = 100
+MEMBERSHIP_ARCHIVE_FRACTION = 0.10
+MEMBERSHIP_REACTIVATE_ABSOLUTE = 100
+MEMBERSHIP_REACTIVATE_FRACTION = 0.10
+
+
+def mass_change_reason(would_archive: int, would_reactivate: int, owned_active: int) -> str | None:
+    """Return a refusal reason when archive or reactivation trips both limits."""
+
+    def _tripped(count: int, absolute: int, fraction: float) -> bool:
+        if count < absolute:
+            return False
+        share = 1.0 if owned_active <= 0 else count / owned_active
+        return share >= fraction
+
+    if _tripped(would_archive, MEMBERSHIP_ARCHIVE_ABSOLUTE, MEMBERSHIP_ARCHIVE_FRACTION):
+        return "archive set meets the absolute and percentage limits"
+    if _tripped(would_reactivate, MEMBERSHIP_REACTIVATE_ABSOLUTE, MEMBERSHIP_REACTIVATE_FRACTION):
+        return "reactivation set meets the absolute and percentage limits"
+    return None
+
+
 def apply_membership(cur, keep_ids: list[str]) -> dict[str, int]:
     """Archive missing catalog ids and reactivate ids that returned. Caller commits."""
     _stage_keep(cur, keep_ids)
@@ -176,7 +200,13 @@ def _connect(url: str):
 def _fetch_catalog_ids(catalog_url: str) -> list[str]:
     with _connect(catalog_url) as src:
         with src.cursor() as cur:
-            cur.execute("SELECT job_id FROM validated_jobs WHERE job_id IS NOT NULL")
+            cur.execute(
+                """
+                SELECT job_id FROM validated_jobs
+                WHERE job_id IS NOT NULL
+                  AND link_status = 'active'
+                """
+            )
             return [row[0] for row in cur.fetchall()]
 
 
@@ -201,16 +231,31 @@ def archive_ui_jobs_not_in_catalog(*, dry_run: bool = False, confirm_target: str
         if dry_run:
             dest.set_session(readonly=True, autocommit=False)
         with dest.cursor() as cur:
+            would_archive, would_reactivate = _count_membership(cur, keep)
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM jobs
+                WHERE external_id LIKE 'jobs-server:%%'
+                  AND status = 'active'
+                  AND is_active IS TRUE
+                """
+            )
+            owned_active = int(cur.fetchone()[0])
+            print(
+                f"would_archive={would_archive} would_reactivate={would_reactivate}",
+                flush=True,
+            )
+            refusal = mass_change_reason(would_archive, would_reactivate, owned_active)
             if dry_run:
-                would_archive, would_reactivate = _count_membership(cur, keep)
                 archived = 0
                 reactivated = 0
+            elif refusal:
+                dest.rollback()
+                raise SystemExit(f"MEMBERSHIP_REFUSED {refusal}")
             else:
                 result = apply_membership(cur, keep)
                 archived = result["archived"]
                 reactivated = result["reactivated"]
-                would_archive = archived
-                would_reactivate = reactivated
             cur.execute("SELECT COUNT(*) FROM jobs WHERE status = 'active'")
             active_after = int(cur.fetchone()[0])
         if dry_run:

@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      JOBREADY_UI_SYNC_APP_URL: postgresql://postgres:postgres@localhost:5432/jobready_ui_sync_app_test
+      JOBREADY_UI_SYNC_CATALOG_URL: postgresql://postgres:postgres@localhost:5432/jobready_ui_sync_catalog_test
+      JOBREADY_DAILY_CATALOG_URL: postgresql://postgres:postgres@localhost:5432/jobready_daily_catalog
+      JOBREADY_DAILY_APP_URL: postgresql://postgres:postgres@localhost:5432/jobready_daily_app
+      JOBREADY_SENTINEL_CODEQUEST_URL: postgresql://postgres:postgres@localhost:5432/jobready_sentinel_codequest
+      JOBREADY_SENTINEL_SCRAPER_URL: postgresql://postgres:postgres@localhost:5432/jobready_sentinel_scraper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install -r naukri_jobs_scraper/requirements.txt
+      - name: Create disposable databases
+        run: python -c "import psycopg2; conn=psycopg2.connect('postgresql://postgres:postgres@localhost:5432/postgres'); conn.autocommit=True; cur=conn.cursor(); names=['jobready_ui_sync_app_test','jobready_ui_sync_catalog_test','jobready_daily_catalog','jobready_daily_app','jobready_sentinel_codequest','jobready_sentinel_scraper']; [cur.execute('CREATE DATABASE ' + name) for name in names]"
+      - name: Run tests
+        run: python -m unittest discover -s codequest_jobs/tests

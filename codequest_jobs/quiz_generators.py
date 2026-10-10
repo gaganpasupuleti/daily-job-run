@@ -1,4 +1,4 @@
-"""Generate MCQ + workbench (HackerRank-style stored) questions for ROLE_* packs."""
+"""LEGACY. Generate MCQ + workbench questions for ROLE_* packs."""
 
 from __future__ import annotations
 

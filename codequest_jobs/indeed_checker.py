@@ -70,7 +70,7 @@ def batch_indeed_expired(jks: list[str]) -> dict[str, bool | None]:
         logger.warning("INDEED_API_KEY is not configured")
         return {jk: None for jk in unique}
 
-    with httpx.Client(timeout=15.0, verify=False) as client:
+    with httpx.Client(timeout=15.0) as client:
         for i in range(0, len(unique), BATCH_SIZE):
             chunk = unique[i : i + BATCH_SIZE]
             query = (

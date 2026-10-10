@@ -1,4 +1,6 @@
-# Sister repo ↔ CodeQuest sync contract
+# LEGACY. Sister repo ↔ CodeQuest sync contract
+
+The daily pipeline no longer writes CodeQuest. See the repository README.
 
 This package (`_tools/codequest_jobs`) is the **ops control plane** for
 [learn-coding-through](https://github.com/gaganpasupuleti/learn-coding-through).

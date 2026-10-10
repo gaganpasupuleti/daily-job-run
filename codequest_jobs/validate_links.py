@@ -187,10 +187,11 @@ def apply_updates(results: list[tuple[str, str, str, str]]) -> None:
 
 
 def sync_dead_to_job_ready(results: list[tuple[str, str, str, str]], *, confirm_target: str) -> dict[str, int]:
-    """Remove newly dead ids from the catalog, then align the application jobs table.
+    """Mark confirmed-expired catalog rows expired. Rows are retained.
 
-    Does nothing to the application database unless confirm_target matches it.
-    The confirmation is checked before either write.
+    Unknown and generic link failures are ignored. The application database
+    is unchanged unless confirm_target matches it. Confirmation is checked
+    before either write.
     """
     from sync_job_ready_ui import archive_ui_jobs_not_in_catalog, assert_application_write_target
 
@@ -198,18 +199,26 @@ def sync_dead_to_job_ready(results: list[tuple[str, str, str, str]], *, confirm_
         {
             job_id
             for _row_id, job_id, _source, status in results
-            if job_id and status in (LINK_STATUS_EXPIRED, LINK_STATUS_LINK_FAILED, LINK_STATUS_UNKNOWN)
+            if job_id and status == LINK_STATUS_EXPIRED
         }
     )
     if not dead_ids:
-        print("  job-ready sync: no dead ids in this batch", flush=True)
-        return {"removed": 0, "dead_ids": 0}
+        print("  job-ready sync: no confirmed-expired ids in this batch", flush=True)
+        return {"removed": 0, "dead_ids": 0, "expired": 0}
     assert_application_write_target(confirm_target)
     catalog = (os.getenv("JOB_READY_DATABASE_URL") or "").strip()
     try:
         with psycopg2.connect(catalog, connect_timeout=20) as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM validated_jobs WHERE job_id = ANY(%s)", (dead_ids,))
+                cur.execute(
+                    """
+                    UPDATE validated_jobs
+                    SET link_status = 'expired', updated_at = NOW()
+                    WHERE job_id = ANY(%s)
+                      AND link_status IS DISTINCT FROM 'expired'
+                    """,
+                    (dead_ids,),
+                )
                 removed = int(cur.rowcount)
             conn.commit()
     except SystemExit:
@@ -217,7 +226,7 @@ def sync_dead_to_job_ready(results: list[tuple[str, str, str, str]], *, confirm_
     except Exception:
         print("  job-ready sync failed", flush=True)
         raise SystemExit("UI_SYNC_FAILED") from None
-    print(f"  job-ready sync: removed {removed} dead of {len(dead_ids)} flagged", flush=True)
+    print(f"  job-ready sync: marked {removed} expired of {len(dead_ids)} confirmed", flush=True)
     ui = {"archived": 0, "reactivated": 0}
     if removed:
         ui = archive_ui_jobs_not_in_catalog(confirm_target=confirm_target)

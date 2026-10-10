@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Create validated_jobs table on job-ready Postgres and push active CodeQuest jobs."""
+"""LEGACY. Push CodeQuest scraped_jobs into JobReady.
+
+The daily pipeline does not use this module. Schema lives in jobready_catalog.py.
+"""
 
 from __future__ import annotations
 
@@ -21,62 +24,9 @@ load_dotenv(SCRAPER_ENV)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from jobready_catalog import SCHEMA_SQL  # noqa: E402
 from run_logger import finish_push_run, start_push_run  # noqa: E402
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS validated_jobs (
-    id BIGSERIAL PRIMARY KEY,
-    job_id TEXT NOT NULL UNIQUE,
-    source_id TEXT,
-    source TEXT NOT NULL,
-    title TEXT NOT NULL,
-    company TEXT,
-    location TEXT,
-    job_type TEXT,
-    job_url TEXT NOT NULL,
-    apply_url TEXT,
-    link_status TEXT NOT NULL DEFAULT 'active',
-    ingest_profile TEXT,
-    date_posted TIMESTAMPTZ,
-    salary_min NUMERIC,
-    salary_max NUMERIC,
-    currency TEXT,
-    scraped_created_at TIMESTAMPTZ,
-    actual_role_id TEXT,
-    actual_role_name TEXT,
-    role_family TEXT,
-    role_level_id TEXT,
-    experience_level TEXT,
-    experience_bucket TEXT,
-    jd_summary TEXT,
-    jd_clean TEXT,
-    jd_responsibilities JSONB,
-    jd_requirements JSONB,
-    keywords_must JSONB,
-    keywords_nice JSONB,
-    practice_focus JSONB,
-    required_skills JSONB,
-    good_to_have_skills JSONB,
-    tools JSONB,
-    programming_languages JSONB,
-    databases JSONB,
-    frameworks JSONB,
-    student_preparation_topics JSONB,
-    quiz_pack_id TEXT,
-    mapping_confidence NUMERIC,
-    manual_review_needed BOOLEAN,
-    approved_status TEXT,
-    has_jd_clean BOOLEAN DEFAULT FALSE,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_validated_jobs_source ON validated_jobs (source);
-CREATE INDEX IF NOT EXISTS idx_validated_jobs_role_family ON validated_jobs (role_family);
-CREATE INDEX IF NOT EXISTS idx_validated_jobs_experience ON validated_jobs (experience_bucket);
-CREATE INDEX IF NOT EXISTS idx_validated_jobs_link_status ON validated_jobs (link_status);
-CREATE INDEX IF NOT EXISTS idx_validated_jobs_synced_at ON validated_jobs (synced_at DESC);
-"""
 
 FETCH_SQL = """
 SELECT
@@ -260,6 +210,11 @@ def main() -> None:
         help="Application database as host:port/database. Required before a prune also updates application jobs. Not a DSN.",
     )
     args = parser.parse_args()
+    if args.prune:
+        raise SystemExit(
+            "PRUNE_REFUSED a filtered or partial snapshot cannot delete catalog rows. "
+            "Expiration comes from confirmed link validation, not scrape absence."
+        )
 
     source_url = (
         os.getenv("CODEQUEST_DATABASE_URL") or os.getenv("DATABASE_URL") or ""
@@ -379,24 +334,10 @@ def main() -> None:
                     )
 
                 if args.prune:
-                    keep_ids = [row["job_id"] for row in rows]
-                    cur.execute("CREATE TEMP TABLE push_keep_ids (job_id TEXT PRIMARY KEY) ON COMMIT DROP")
-                    if keep_ids:
-                        execute_values(
-                            cur,
-                            "INSERT INTO push_keep_ids (job_id) VALUES %s",
-                            [(i,) for i in keep_ids],
-                        )
-                    cur.execute(
-                        """
-                        DELETE FROM validated_jobs v
-                        WHERE NOT EXISTS (
-                          SELECT 1 FROM push_keep_ids k WHERE k.job_id = v.job_id
-                        )
-                        """
+                    raise SystemExit(
+                        "PRUNE_REFUSED a filtered or partial snapshot cannot delete catalog rows. "
+                        "Expiration comes from confirmed link validation, not scrape absence."
                     )
-                    print(f"Pruned stale/older rows: {cur.rowcount}", flush=True)
-                    dest.commit()
 
                 cur.execute(
                     """

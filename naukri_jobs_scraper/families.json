@@ -1,0 +1,23 @@
+{
+  "families": [
+    {"id": "java-backend", "name": "Java Backend Developer", "keywords": ["java developer fresher", "java intern"]},
+    {"id": "python-dev", "name": "Python Developer", "keywords": ["python developer fresher", "python intern"]},
+    {"id": "frontend-react", "name": "Frontend React Developer", "keywords": ["react developer fresher", "frontend developer intern"]},
+    {"id": "fullstack-web", "name": "Full Stack Developer", "keywords": ["full stack developer fresher", "full stack intern"]},
+    {"id": "qa-testing", "name": "QA Engineer", "keywords": ["qa engineer fresher", "software testing intern"]},
+    {"id": "data-analyst", "name": "Data Analyst", "keywords": ["data analyst fresher", "data analyst intern"]},
+    {"id": "powerbi-analyst", "name": "Power BI Analyst", "keywords": ["power bi developer fresher", "power bi intern"]},
+    {"id": "data-engineer", "name": "Data Engineer", "keywords": ["data engineer fresher", "data engineer intern"]},
+    {"id": "ml-ai", "name": "Machine Learning Engineer", "keywords": ["machine learning engineer fresher", "ml intern"]},
+    {"id": "gen-ai", "name": "Generative AI Engineer", "keywords": ["generative ai fresher", "gen ai intern"]},
+    {"id": "ai-engineer", "name": "Applied AI / Prompt Engineer", "keywords": ["ai engineer fresher", "prompt engineer intern", "ai developer intern"]},
+    {"id": "agentic-ai", "name": "Agentic AI Engineer", "keywords": ["agentic ai fresher", "llm engineer intern"]},
+    {"id": "it-support", "name": "IT Support", "keywords": ["it support fresher", "helpdesk intern"]},
+    {"id": "servicenow", "name": "ServiceNow Developer", "keywords": ["servicenow developer fresher", "servicenow intern"]},
+    {"id": "business-analyst", "name": "Business Analyst", "keywords": ["business analyst fresher", "business analyst intern"]},
+    {"id": "cyber-security", "name": "Cyber Security Analyst", "keywords": ["cyber security fresher", "cybersecurity intern"]},
+    {"id": "salesforce-crm", "name": "Salesforce Developer", "keywords": ["salesforce developer fresher", "salesforce intern"]},
+    {"id": "dynamics-crm", "name": "Dynamics 365 Developer", "keywords": ["dynamics 365 fresher", "dynamics crm intern"]},
+    {"id": "power-platform", "name": "Power Platform Developer", "keywords": ["power platform developer fresher", "power automate intern"]}
+  ]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy scraped jobs from testing DB to production naukri_scraper table."""
+"""LEGACY. Copy scraped jobs from testing DB to production naukri_scraper table."""
 
 from __future__ import annotations
 

@@ -1,71 +1,44 @@
 # Daily job run
 
-Scrape India fresher/intern jobs, validate links, tag `ROLE_*` families, and push rows into every target Postgres DB.
+daily-job-run collects and maintains the source job catalog used by JobReady. JobReady is its only production data destination.
 
-This repo is **ops only** — no book PDFs, no scrape dumps, no `.env` secrets.
+The pipeline scrapes configured boards, normalizes and dedupes the rows, classifies them in memory, and upserts `validated_jobs` in the JobReady catalog. A later observation updates `synced_at`. `scraped_created_at` stays at the first time that source identity was stored. `updated_at` moves only when the catalog content or link status changes. Confirmed closed jobs stay in the catalog with `link_status = expired`. A miss in today's scrape is not expiration.
 
-## What it does
-
-| Step | Tool | Writes |
-|------|------|--------|
-| **Run jobs** | `naukri_jobs_scraper/run_all_sources.py` | Local `naukri_scraper` + CodeQuest `scraped_jobs` |
-| **Validate** | `codequest_jobs/validate_links.py` | `scraped_jobs.link_status` |
-| **Tag** | `codequest_jobs/enrichment.py` | `job_enrichments` (`ROLE_*`, clean JD, keywords) |
-| **Push** | `codequest_jobs/push_validated_to_job_ready.py` | job-ready `validated_jobs` |
-
-Scheduled Railway cron (validate → tag → push) lives in `link_validator_service/run_scheduled.py`.
-
-## Layout
-
-| Path | Role |
-|------|------|
-| [`naukri_jobs_scraper/`](naukri_jobs_scraper/) | Naukri + Indeed + LinkedIn + Foundit scrape and dual-write |
-| [`codequest_jobs/`](codequest_jobs/) | Link check, ROLE tagging, quiz packs, push to job-ready |
-| [`link_validator_service/`](link_validator_service/) | Daily cron: validate + tag + push + prune stale live rows |
-
-## Setup
+## Daily command
 
 ```bash
-cd naukri_jobs_scraper
-pip install -r requirements.txt
-cp .env.example .env
+python codequest_jobs/run_jobready_daily.py
 ```
 
-Set:
+That command scrapes, upserts the catalog, then validates a rotating slice of `validated_jobs`. The default validation budget is 200 rows. Up to half of that budget is reserved for new jobs and re-observed jobs that have never received a conclusive check. The rest of the budget walks the oldest `link_checked_at`, so a normal day keeps moving through the catalog. `--full-audit` checks every row. `--validation-limit` changes the budget.
 
-- `DATABASE_URL` — local scraper Postgres (`naukri_scraper`)
-- `CODEQUEST_DATABASE_URL` — CodeQuest app Postgres (`scraped_jobs`, enrichments)
-- `JOB_READY_DATABASE_URL` — job-ready-platform Postgres (`validated_jobs`)
+A job found by search starts active. Seeing it in search again does not change `link_status`. An expired row stays expired until the validator returns `confirmed_active`. Only `confirmed_expired` marks a row expired. Link checks update `link_checked_at` and do not move `synced_at`.
 
-## Daily commands
-
-Full pipeline (scrape → validate → tag → quizzes):
+Before the first run, and after a schema review:
 
 ```bash
-python codequest_jobs/run_jobs_pipeline.py --env-file naukri_jobs_scraper/.env
+python codequest_jobs/run_jobready_daily.py --preflight
+python codequest_jobs/run_jobready_daily.py --apply-schema
 ```
 
-Scrape only, all sources, both DBs:
+`--preflight` is read-only. It checks that the catalog is reachable, `validated_jobs` exists, required columns and indexes are present, and source identities are not duplicated. It prints `host`, `port`, and database name, not a connection string. `--apply-schema` applies idempotent catalog DDL and refuses when duplicate identities exist. A normal daily run refuses if that schema is missing. It does not create the table itself.
 
-```bash
-python naukri_jobs_scraper/run_all_sources.py --env-file naukri_jobs_scraper/.env
-```
+Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
 
-Validate links, then push active jobs to job-ready:
+Required configuration: `JOB_READY_DATABASE_URL`.
 
-```bash
-python codequest_jobs/validate_links.py
-python codequest_jobs/push_validated_to_job_ready.py
-```
+Set `INDEED_API_KEY` when Indeed expiry checks should run. Leave it empty to skip those checks.
 
-Railway one-shot (already deployed as the daily cron):
+Application membership is separate. The command prints `would_archive` and `would_reactivate` before any application write. Pass `--sync-application --confirm-target host:port/database` only when `JOB_READY_APP_DATABASE_URL` should be updated. The confirmation is the host, port, and database name. It is not a connection string. Membership includes catalog rows whose `link_status` is `active`. A write is refused when an archive or reactivation is at least 100 jobs and at least 10 percent of the integration-owned active application jobs. There is no bypass flag. A source-wide scrape failure also refuses the membership write and does not expire unrelated catalog rows.
 
-```bash
-python link_validator_service/run_scheduled.py
-```
+One run holds a PostgreSQL advisory lock on the catalog. A second run exits while that lock is held.
 
-## Related
+Each run writes `codequest_jobs/output/jobready_daily_YYYYMMDD_HHMMSS.json`.
 
-- App: https://github.com/gaganpasupuleti/learn-coding-through
-- Job-ready UI: https://github.com/gaganpasupuleti/job-ready-platform
-- Earlier ops copy: https://github.com/gaganpasupuleti/codequest-jobs-ops
+## Sources
+
+Naukri, Indeed, LinkedIn, Google, and Foundit, for the role families in `naukri_jobs_scraper/families.json`.
+
+## Legacy commands
+
+The modules in [LEGACY.md](LEGACY.md) still talk to CodeQuest or the old `naukri_scraper` database. Do not use them for the daily catalog. `link_validator_service/run_scheduled.py` only delegates to the command above.

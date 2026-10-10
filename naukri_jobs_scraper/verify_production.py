@@ -1,3 +1,4 @@
+# LEGACY. Inspects the old production scraper database. Not part of the daily pipeline.
 import json
 import os
 from pathlib import Path

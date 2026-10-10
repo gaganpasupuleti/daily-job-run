@@ -9,7 +9,11 @@ venv/
 output/*.json
 output/*.csv
 output/*.xlsx
+**/output/*.json
+**/output/*.csv
+**/output/*.xlsx
 !output/.gitkeep
+!**/.gitkeep
 .DS_Store
 Thumbs.db
 .idea/

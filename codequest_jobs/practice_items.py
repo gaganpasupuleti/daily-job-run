@@ -1,4 +1,4 @@
-"""Job-specific practice items (MCQ / coding / SQL) from clean keywords."""
+"""LEGACY. Job-specific practice items (MCQ / coding / SQL) from clean keywords."""
 
 from __future__ import annotations
 
