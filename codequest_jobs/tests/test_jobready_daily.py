@@ -60,6 +60,45 @@ def _confirm(database_url: str) -> str:
     return f"{host}:{port}/{database}"
 
 
+class _CountingCursor:
+    def __init__(self, inner, owner: "_CountingConnection") -> None:
+        self._inner = inner
+        self._owner = owner
+
+    def execute(self, query, vars=None):
+        self._owner.executes += 1
+        if vars is None:
+            return self._inner.execute(query)
+        return self._inner.execute(query, vars)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __enter__(self):
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._inner.__exit__(exc_type, exc, tb)
+
+
+class _CountingConnection:
+    """Count cursor executes. The wrapped connection still performs the writes."""
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+        self.executes = 0
+
+    def cursor(self, *args, **kwargs):
+        return _CountingCursor(self._connection.cursor(*args, **kwargs), self)
+
+    def commit(self):
+        return self._connection.commit()
+
+    def rollback(self):
+        return self._connection.rollback()
+
+
 class ContractTests(unittest.TestCase):
     def test_clean_clone_does_not_require_role_reports(self) -> None:
         text = (SCRAPER / "role_keywords.py").read_text(encoding="utf-8")
@@ -859,6 +898,211 @@ class CatalogTests(unittest.TestCase):
                 cur.execute("DELETE FROM validated_jobs WHERE source_id = 'same-source'")
             self.catalog.commit()
             catalog.ensure_schema(self.catalog)
+
+    def test_write_timeouts_are_transaction_local(self) -> None:
+        from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+        with self.catalog.cursor() as cur:
+            cur.execute("SELECT 1")
+        self.assertNotEqual(self.catalog.info.transaction_status, TRANSACTION_STATUS_IDLE)
+        catalog.release_read_transaction(self.catalog)
+        self.assertEqual(self.catalog.info.transaction_status, TRANSACTION_STATUS_IDLE)
+        with self.catalog.cursor() as cur:
+            catalog.apply_write_timeouts(cur)
+            cur.execute(
+                """
+                SELECT current_setting('lock_timeout'),
+                       current_setting('statement_timeout'),
+                       current_setting('idle_in_transaction_session_timeout')
+                """
+            )
+            self.assertEqual(cur.fetchone(), ("10s", "2min", "3min"))
+        self.catalog.rollback()
+        with self.catalog.cursor() as cur:
+            cur.execute("SELECT current_setting('lock_timeout')")
+            self.assertEqual(cur.fetchone()[0], "0")
+
+    def test_catalog_connections_use_application_names(self) -> None:
+        conn = catalog.connect(CATALOG_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_setting('application_name')")
+                self.assertEqual(cur.fetchone()[0], "daily-job-run")
+        finally:
+            conn.close()
+        lock = catalog.DailyRunLock(CATALOG_URL)
+        lock.acquire()
+        try:
+            with lock.conn.cursor() as cur:
+                cur.execute("SELECT current_setting('application_name')")
+                self.assertEqual(cur.fetchone()[0], "daily-job-run-lock")
+        finally:
+            lock.release()
+
+    def test_bulk_upsert_uses_few_statements_and_keeps_semantics(self) -> None:
+        """The old path issued about 3 statements per existing row and 5 per new row.
+
+        One hundred existing rows were about 300 statements, one hundred new rows
+        about 500, and a 1,000-row mix about 4,000. The batch path stays small.
+        """
+        existing_urls = [f"https://example.test/jobs/bulk-existing-{index}" for index in range(1000)]
+        seeded = [daily.prepare_catalog_row(_job(url, title=f"Role {index}")) for index, url in enumerate(existing_urls)]
+        catalog.upsert_jobs(self.catalog, seeded)
+        expired_url = existing_urls[0]
+        unchanged_url = existing_urls[1]
+        changed_url = existing_urls[2]
+        with self.catalog.cursor() as cur:
+            cur.execute(
+                "UPDATE validated_jobs SET link_status = 'expired' WHERE job_url = %s",
+                (expired_url,),
+            )
+        self.catalog.commit()
+        expired_before = self._row(expired_url)
+        unchanged_before = self._row(unchanged_url)
+        time.sleep(0.05)
+        reobserved = []
+        for index, url in enumerate(existing_urls[:750]):
+            title = "Changed role" if url == changed_url else f"Role {index}"
+            reobserved.append(daily.prepare_catalog_row(_job(url, title=title)))
+        new_rows = [
+            daily.prepare_catalog_row(_job(f"https://example.test/jobs/bulk-new-{index}"))
+            for index in range(250)
+        ]
+        counter = _CountingConnection(self.catalog)
+        started = time.perf_counter()
+        result = catalog.upsert_jobs(counter, reobserved + new_rows)
+        elapsed = time.perf_counter() - started
+        print(f"bulk_upsert_sql={counter.executes} elapsed_sec={elapsed:.3f}", flush=True)
+        self.assertLessEqual(counter.executes, 20)
+        self.assertEqual(result["new"], 250)
+        self.assertEqual(result["reobserved"], 750)
+        self.assertGreater(result["updated"], 0)
+        self.assertGreater(result["unchanged"], 0)
+        expired_after = self._row(expired_url)
+        unchanged_after = self._row(unchanged_url)
+        self.assertEqual(expired_after[0], expired_before[0])
+        self.assertEqual(expired_after[1], "expired")
+        self.assertEqual(expired_after[2], expired_before[2])
+        self.assertGreater(expired_after[3], expired_before[3])
+        self.assertEqual(unchanged_after[0], unchanged_before[0])
+        self.assertEqual(unchanged_after[2], unchanged_before[2])
+        self.assertGreater(unchanged_after[3], unchanged_before[3])
+        self.assertEqual(unchanged_after[4], unchanged_before[4])
+        self.assertEqual(self._count(), 1250)
+        with self.catalog.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT source_id FROM validated_jobs
+                    WHERE source_id IS NOT NULL AND btrim(source_id) <> ''
+                    GROUP BY source_id HAVING COUNT(*) > 1
+                ) dupes
+                """
+            )
+            self.assertEqual(cur.fetchone()[0], 0)
+            cur.execute("SELECT COUNT(DISTINCT job_id), COUNT(*) FROM validated_jobs")
+            distinct_ids, total = cur.fetchone()
+            self.assertEqual(distinct_ids, total)
+
+    def test_upsert_rolls_back_the_whole_batch(self) -> None:
+        url = "https://example.test/jobs/kept"
+        self._run([_job(url)])
+        bad = daily.prepare_catalog_row(_job("https://example.test/jobs/bad-title"))
+        bad["title"] = None
+        with self.assertRaises(SystemExit) as caught:
+            catalog.upsert_jobs(self.catalog, [bad, daily.prepare_catalog_row(_job("https://example.test/jobs/also-new"))])
+        self.assertIn("CATALOG_WRITE_FAILED", str(caught.exception))
+        self.assertIn("stage=catalog_write", str(caught.exception))
+        self.assertEqual(self._count(), 1)
+        self.assertIsNotNone(self._row(url))
+        self.assertIsNone(self._row("https://example.test/jobs/also-new"))
+
+    def test_lock_timeout_rolls_back_and_releases_allocation(self) -> None:
+        previous = catalog.LOCK_TIMEOUT
+        catalog.LOCK_TIMEOUT = "300ms"
+        holder = self.psycopg2.connect(CATALOG_URL, connect_timeout=8)
+        try:
+            holder.autocommit = False
+            with holder.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (catalog.ALLOC_LOCK_KEY,))
+            with self.assertRaises(SystemExit) as caught:
+                catalog.upsert_jobs(
+                    self.catalog,
+                    [daily.prepare_catalog_row(_job("https://example.test/jobs/lock-wait"))],
+                )
+            self.assertIn("lock_timeout", str(caught.exception))
+            self.assertEqual(self._count(), 0)
+        finally:
+            catalog.LOCK_TIMEOUT = previous
+            holder.rollback()
+            holder.close()
+        catalog.upsert_jobs(self.catalog, [daily.prepare_catalog_row(_job("https://example.test/jobs/lock-wait"))])
+        self.assertEqual(self._count(), 1)
+
+    def test_run_lock_releases_when_catalog_write_fails(self) -> None:
+        from run_all_sources import ScrapeResult
+        from unittest.mock import patch
+
+        def collect(**_kwargs):
+            return ScrapeResult(
+                jobs=[_job("https://example.test/jobs/lock-release")],
+                per_source={"naukri": 1},
+                per_family={"python-dev": 1},
+                errors=[],
+                sources_attempted=["naukri"],
+                started_at="2026-10-10T00:00:00+00:00",
+                finished_at="2026-10-10T00:00:01+00:00",
+                source_health={
+                    "naukri": {
+                        "attempted": True,
+                        "succeeded": True,
+                        "failed": False,
+                        "jobs_returned": 1,
+                        "errors": [],
+                    }
+                },
+            )
+
+        previous = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        try:
+            args = daily.parse_args(["--sources", "naukri", "--validation-limit", "1"])
+            with patch("run_jobready_daily.upsert_jobs", side_effect=RuntimeError("forced catalog write failure")):
+                with self.assertRaises(RuntimeError):
+                    daily.execute_daily(args, collect=collect, probes={"generic": lambda row: ("inconclusive", "fixture", "naukri")})
+            lock = catalog.DailyRunLock(CATALOG_URL)
+            lock.acquire()
+            lock.release()
+        finally:
+            self._restore("JOB_READY_DATABASE_URL", previous)
+
+    def test_concurrent_block_allocation_is_unique(self) -> None:
+        errors: list[BaseException] = []
+
+        def worker(offset: int) -> None:
+            conn = self.psycopg2.connect(CATALOG_URL, connect_timeout=8)
+            try:
+                rows = [
+                    daily.prepare_catalog_row(_job(f"https://example.test/jobs/block-{offset}-{index}"))
+                    for index in range(5)
+                ]
+                catalog.upsert_jobs(conn, rows)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=worker, args=(offset,)) for offset in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        self.assertEqual(errors, [])
+        with self.catalog.cursor() as cur:
+            cur.execute("SELECT job_id FROM validated_jobs")
+            ids = [row[0] for row in cur.fetchall()]
+        self.assertEqual(len(ids), 20)
+        self.assertEqual(len(set(ids)), 20)
 
     def _assert_sentinel_empty(self, url: str) -> None:
         if not url:

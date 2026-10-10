@@ -8,17 +8,24 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_values
 
 # Session lock for the whole daily run. Released on disconnect.
 RUN_LOCK_KEY = 87264011
 # Transaction lock around new CQJ allocation.
 ALLOC_LOCK_KEY = 87264021
+CATALOG_APPLICATION_NAME = "daily-job-run"
+LOCK_APPLICATION_NAME = "daily-job-run-lock"
+# Transaction-local only. A timeout aborts the whole catalog batch.
+LOCK_TIMEOUT = "10s"
+STATEMENT_TIMEOUT = "120s"
+IDLE_IN_TRANSACTION_TIMEOUT = "180s"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS validated_jobs (
@@ -201,8 +208,12 @@ def catalog_url() -> str:
     return url
 
 
-def connect(url: str | None = None):
-    return psycopg2.connect(url or catalog_url(), connect_timeout=20)
+def connect(url: str | None = None, *, application_name: str = CATALOG_APPLICATION_NAME):
+    return psycopg2.connect(
+        url or catalog_url(),
+        connect_timeout=20,
+        application_name=application_name,
+    )
 
 
 def ensure_schema(conn) -> None:
@@ -316,7 +327,7 @@ class DailyRunLock:
         self.conn = None
 
     def acquire(self) -> None:
-        self.conn = connect(self.url)
+        self.conn = connect(self.url, application_name=LOCK_APPLICATION_NAME)
         self.conn.autocommit = True
         with self.conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (RUN_LOCK_KEY,))
@@ -361,22 +372,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def allocate_job_id(conn, when: datetime | None = None) -> str:
-    """Next CQJ-YYYYMMDD-NNNN. Safe across concurrent transactions."""
+def allocate_job_ids(cur, count: int, when: datetime | None = None) -> list[str]:
+    """Reserve a contiguous CQJ block. The advisory lock is held until commit or rollback."""
+    if count <= 0:
+        return []
     moment = when or _now()
     day = moment.strftime("%Y%m%d")
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (ALLOC_LOCK_KEY,))
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(CAST(substring(job_id from 14) AS INTEGER)), 0)
+        FROM validated_jobs
+        WHERE job_id ~ %s
+        """,
+        (rf"^CQJ-{day}-[0-9]+$",),
+    )
+    current = int(cur.fetchone()[0])
+    return [f"CQJ-{day}-{current + offset:04d}" for offset in range(1, count + 1)]
+
+
+def allocate_job_id(conn, when: datetime | None = None) -> str:
+    """Next CQJ-YYYYMMDD-NNNN. The daily batch path allocates a block instead."""
     with conn.cursor() as cur:
-        cur.execute("SELECT pg_advisory_xact_lock(%s)", (ALLOC_LOCK_KEY,))
-        cur.execute(
-            """
-            SELECT COALESCE(MAX(CAST(substring(job_id from 14) AS INTEGER)), 0)
-            FROM validated_jobs
-            WHERE job_id ~ %s
-            """,
-            (rf"^CQJ-{day}-[0-9]+$",),
-        )
-        current = int(cur.fetchone()[0])
-    return f"CQJ-{day}-{current + 1:04d}"
+        return allocate_job_ids(cur, 1, when)[0]
 
 
 def _json(value: Any):
@@ -470,186 +488,414 @@ def _load_content(cur, job_id: str) -> dict[str, Any]:
     return {field: row[index] for index, field in enumerate(CONTENT_FIELDS)}
 
 
-def upsert_jobs(conn, jobs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Insert new source identities and refresh jobs seen again.
+FETCH_COLUMNS = (
+    "job_id",
+    "source_id",
+    "source",
+    "job_url",
+    "link_status",
+    "scraped_created_at",
+    *CONTENT_FIELDS,
+)
 
-    A search hit does not change link_status. New rows start active.
-    Existing expired rows stay expired until a validator confirms them active.
-    scraped_created_at is immutable. synced_at advances only for this scrape.
-    Blank date, salary, JD, and skill values do not erase stored values.
+JSON_FIELDS = {
+    "jd_requirements",
+    "jd_responsibilities",
+    "required_skills",
+    "good_to_have_skills",
+    "tools",
+    "programming_languages",
+    "databases",
+    "frameworks",
+    "student_preparation_topics",
+}
+
+RESOLVED_FIELDS = (
+    "job_id",
+    "is_new",
+    "content_changed",
+    "source_id",
+    "source",
+    "title",
+    "company",
+    "location",
+    "job_type",
+    "job_url",
+    "apply_url",
+    "ingest_profile",
+    "date_posted",
+    "salary_min",
+    "salary_max",
+    "currency",
+    "role_family",
+    "actual_role_id",
+    "actual_role_name",
+    "role_level_id",
+    "experience_level",
+    "experience_bucket",
+    "jd_summary",
+    "jd_clean",
+    "jd_requirements",
+    "jd_responsibilities",
+    "required_skills",
+    "good_to_have_skills",
+    "tools",
+    "programming_languages",
+    "databases",
+    "frameworks",
+    "student_preparation_topics",
+    "manual_review_needed",
+    "approved_status",
+    "mapping_confidence",
+    "has_jd_clean",
+)
+
+RESOLVED_TABLE_SQL = """
+CREATE TEMP TABLE catalog_resolved (
+    job_id TEXT,
+    is_new BOOLEAN NOT NULL,
+    content_changed BOOLEAN NOT NULL,
+    source_id TEXT,
+    source TEXT,
+    title TEXT,
+    company TEXT,
+    location TEXT,
+    job_type TEXT,
+    job_url TEXT,
+    apply_url TEXT,
+    ingest_profile TEXT,
+    date_posted TIMESTAMPTZ,
+    salary_min NUMERIC,
+    salary_max NUMERIC,
+    currency TEXT,
+    role_family TEXT,
+    actual_role_id TEXT,
+    actual_role_name TEXT,
+    role_level_id TEXT,
+    experience_level TEXT,
+    experience_bucket TEXT,
+    jd_summary TEXT,
+    jd_clean TEXT,
+    jd_requirements JSONB,
+    jd_responsibilities JSONB,
+    required_skills JSONB,
+    good_to_have_skills JSONB,
+    tools JSONB,
+    programming_languages JSONB,
+    databases JSONB,
+    frameworks JSONB,
+    student_preparation_topics JSONB,
+    manual_review_needed BOOLEAN,
+    approved_status TEXT,
+    mapping_confidence NUMERIC,
+    has_jd_clean BOOLEAN
+) ON COMMIT DROP
+"""
+
+
+def release_read_transaction(conn) -> None:
+    """End a read-only transaction before a long scrape.
+
+    Leaving it open makes the catalog session idle in a transaction for the
+    whole scrape and freezes NOW() at the start of that transaction.
     """
-    counts: dict[str, Any] = {
+    conn.rollback()
+
+
+def apply_write_timeouts(cur) -> None:
+    """Bound this transaction only. Do not change database-wide settings."""
+    for name, value in (
+        ("lock_timeout", LOCK_TIMEOUT),
+        ("statement_timeout", STATEMENT_TIMEOUT),
+        ("idle_in_transaction_session_timeout", IDLE_IN_TRANSACTION_TIMEOUT),
+    ):
+        cur.execute("SELECT set_config(%s, %s, true)", (name, value))
+        cur.fetchone()
+
+
+def _empty_upsert_counts() -> dict[str, Any]:
+    return {
         "new": 0,
         "updated": 0,
         "unchanged": 0,
         "reobserved": 0,
         "new_ids": [],
         "reobserved_ids": [],
+        "catalog_plan_sec": 0.0,
+        "catalog_write_sec": 0.0,
     }
+
+
+def _record(row: tuple[Any, ...]) -> dict[str, Any]:
+    return dict(zip(FETCH_COLUMNS, row, strict=True))
+
+
+def _prefetch_existing(cur, jobs: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    """Load matching catalog rows in a few statements, not one lookup per job."""
+    columns = ", ".join(FETCH_COLUMNS)
+    source_ids = [job["source_id"] for job in jobs if str(job.get("source_id") or "").strip()]
+    by_source_id: dict[str, dict[str, Any]] = {}
+    if source_ids:
+        cur.execute(
+            f"SELECT {columns} FROM validated_jobs WHERE source_id = ANY(%s)",
+            (source_ids,),
+        )
+        for row in cur.fetchall():
+            record = _record(row)
+            if record["source_id"]:
+                by_source_id[record["source_id"]] = record
+    missing = [job for job in jobs if job.get("source_id") not in by_source_id]
+    by_url: dict[tuple[str, str], dict[str, Any]] = {}
+    if missing:
+        cur.execute(
+            """
+            CREATE TEMP TABLE incoming_identity (
+                source TEXT,
+                job_url TEXT
+            ) ON COMMIT DROP
+            """
+        )
+        execute_values(
+            cur,
+            "INSERT INTO incoming_identity (source, job_url) VALUES %s",
+            [(job.get("source") or "", job.get("job_url") or "") for job in missing],
+            page_size=max(len(missing), 1),
+        )
+        qualified = ", ".join(f"v.{name}" for name in FETCH_COLUMNS)
+        cur.execute(
+            f"""
+            SELECT {qualified}
+            FROM incoming_identity AS i
+            JOIN validated_jobs AS v
+              ON lower(v.source) = lower(i.source)
+             AND v.job_url = i.job_url
+            ORDER BY v.scraped_created_at NULLS LAST, v.job_id
+            """
+        )
+        for row in cur.fetchall():
+            record = _record(row)
+            key = ((record["source"] or "").lower(), record["job_url"] or "")
+            by_url.setdefault(key, record)
+    return by_source_id, by_url
+
+
+def _match_existing(
+    job: dict[str, Any],
+    by_source_id: dict[str, dict[str, Any]],
+    by_url: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    source_id = str(job.get("source_id") or "").strip()
+    if source_id and source_id in by_source_id:
+        return by_source_id[source_id]
+    return by_url.get(((job.get("source") or "").lower(), job.get("job_url") or ""))
+
+
+def _plan_rows(
+    jobs: list[dict[str, Any]],
+    by_source_id: dict[str, dict[str, Any]],
+    by_url: dict[tuple[str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Last incoming row wins when one batch repeats an identity."""
+    planned: dict[tuple[str, str], dict[str, Any]] = {}
+    for job in jobs:
+        existing = _match_existing(job, by_source_id, by_url)
+        if existing:
+            merged = _merged_content(existing, job)
+            stored_source_id = str(existing.get("source_id") or "").strip()
+            merged["source_id"] = stored_source_id or job.get("source_id")
+            entry = {
+                "is_new": False,
+                "content_changed": _content_changed(existing, merged),
+                "job_id": existing["job_id"],
+                "payload": merged,
+            }
+            planned[("id", existing["job_id"])] = entry
+            continue
+        payload = dict(job)
+        payload["source_id"] = job.get("source_id")
+        entry = {
+            "is_new": True,
+            "content_changed": True,
+            "job_id": None,
+            "payload": payload,
+        }
+        planned[("new", str(job.get("source_id") or ""), str(job.get("job_url") or ""))] = entry
+    return list(planned.values())
+
+
+def _resolved_tuple(entry: dict[str, Any]) -> tuple[Any, ...]:
+    payload = entry["payload"]
+    values: list[Any] = []
+    for name in RESOLVED_FIELDS:
+        if name == "job_id":
+            values.append(entry["job_id"])
+        elif name == "is_new":
+            values.append(entry["is_new"])
+        elif name == "content_changed":
+            values.append(entry["content_changed"])
+        elif name == "has_jd_clean":
+            values.append(bool(payload.get("jd_clean")))
+        elif name in JSON_FIELDS:
+            values.append(_json(payload.get(name)))
+        else:
+            values.append(payload.get(name))
+    return tuple(values)
+
+
+def _write_resolved(cur, planned: list[dict[str, Any]]) -> None:
+    cur.execute(RESOLVED_TABLE_SQL)
+    execute_values(
+        cur,
+        f"INSERT INTO catalog_resolved ({', '.join(RESOLVED_FIELDS)}) VALUES %s",
+        [_resolved_tuple(entry) for entry in planned],
+        page_size=max(len(planned), 1),
+    )
+    cur.execute(
+        """
+        UPDATE validated_jobs AS v SET
+            source_id = r.source_id,
+            source = r.source,
+            title = r.title,
+            company = r.company,
+            location = r.location,
+            job_type = r.job_type,
+            job_url = r.job_url,
+            apply_url = r.apply_url,
+            ingest_profile = r.ingest_profile,
+            date_posted = r.date_posted,
+            salary_min = r.salary_min,
+            salary_max = r.salary_max,
+            currency = r.currency,
+            role_family = r.role_family,
+            actual_role_id = r.actual_role_id,
+            actual_role_name = r.actual_role_name,
+            role_level_id = r.role_level_id,
+            experience_level = r.experience_level,
+            experience_bucket = r.experience_bucket,
+            jd_summary = r.jd_summary,
+            jd_clean = r.jd_clean,
+            jd_requirements = r.jd_requirements,
+            jd_responsibilities = r.jd_responsibilities,
+            required_skills = r.required_skills,
+            good_to_have_skills = r.good_to_have_skills,
+            tools = r.tools,
+            programming_languages = r.programming_languages,
+            databases = r.databases,
+            frameworks = r.frameworks,
+            student_preparation_topics = r.student_preparation_topics,
+            mapping_confidence = r.mapping_confidence,
+            manual_review_needed = r.manual_review_needed,
+            approved_status = r.approved_status,
+            has_jd_clean = r.has_jd_clean,
+            synced_at = NOW(),
+            updated_at = CASE WHEN r.content_changed THEN NOW() ELSE v.updated_at END
+        FROM catalog_resolved AS r
+        WHERE v.job_id = r.job_id
+          AND NOT r.is_new
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO validated_jobs (
+            job_id, source_id, source, title, company, location, job_type,
+            job_url, apply_url, link_status, ingest_profile, date_posted,
+            salary_min, salary_max, currency, role_family,
+            actual_role_id, actual_role_name, role_level_id, experience_level,
+            experience_bucket, jd_summary, jd_clean, jd_requirements, jd_responsibilities,
+            required_skills, good_to_have_skills, tools, programming_languages,
+            databases, frameworks, student_preparation_topics,
+            manual_review_needed, approved_status, mapping_confidence, has_jd_clean,
+            scraped_created_at, synced_at, updated_at
+        )
+        SELECT
+            job_id, source_id, source, title, company, location, job_type,
+            job_url, apply_url, 'active', ingest_profile, date_posted,
+            salary_min, salary_max, currency, role_family,
+            actual_role_id, actual_role_name, role_level_id, experience_level,
+            experience_bucket, jd_summary, jd_clean, jd_requirements, jd_responsibilities,
+            required_skills, good_to_have_skills, tools, programming_languages,
+            databases, frameworks, student_preparation_topics,
+            manual_review_needed, approved_status, mapping_confidence, has_jd_clean,
+            NOW(), NOW(), NOW()
+        FROM catalog_resolved
+        WHERE is_new
+        """
+    )
+
+
+def _write_failure(exc: BaseException, stage: str) -> str:
+    text = str(exc).lower()
+    if "://" in text or "password" in text:
+        reason = "catalog write failed"
+    elif "lock timeout" in text:
+        reason = "lock_timeout"
+    elif "statement timeout" in text:
+        reason = "statement_timeout"
+    elif "idle" in text and "transaction" in text:
+        reason = "idle_in_transaction_timeout"
+    else:
+        reason = "catalog write failed"
+    return f"CATALOG_WRITE_FAILED stage={stage} {reason}"
+
+
+def upsert_jobs(conn, jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Insert new source identities and refresh jobs seen again.
+
+    The batch is one transaction: prefetch, one CQJ block, then set-based
+    update and insert. A timeout or write error rolls the whole batch back.
+    A search hit does not change link_status. New rows start active.
+    Existing expired rows stay expired until a validator confirms them active.
+    scraped_created_at is immutable. synced_at advances only for this scrape.
+    Blank date, salary, JD, and skill values do not erase stored values.
+    """
+    counts = _empty_upsert_counts()
     if not jobs:
         return counts
-    with conn.cursor() as cur:
-        for job in jobs:
-            source_id = job["source_id"]
-            existing = _find(cur, source_id, job["source"], job["job_url"])
-            if existing:
-                job_id, _created_at, _updated_at, _previous_status, _stored_source_id = existing
-                current = _load_content(cur, job_id)
-                merged = _merged_content(current, job)
-                changed = _content_changed(current, merged)
-                cur.execute(
-                    """
-                    UPDATE validated_jobs SET
-                        source_id = COALESCE(NULLIF(source_id, ''), %s),
-                        source = %s,
-                        title = %s,
-                        company = %s,
-                        location = %s,
-                        job_type = %s,
-                        job_url = %s,
-                        apply_url = %s,
-                        ingest_profile = %s,
-                        date_posted = %s,
-                        salary_min = %s,
-                        salary_max = %s,
-                        currency = %s,
-                        role_family = %s,
-                        actual_role_id = %s,
-                        actual_role_name = %s,
-                        role_level_id = %s,
-                        experience_level = %s,
-                        experience_bucket = %s,
-                        jd_summary = %s,
-                        jd_clean = %s,
-                        jd_requirements = %s,
-                        jd_responsibilities = %s,
-                        required_skills = %s,
-                        good_to_have_skills = %s,
-                        tools = %s,
-                        programming_languages = %s,
-                        databases = %s,
-                        frameworks = %s,
-                        student_preparation_topics = %s,
-                        mapping_confidence = %s,
-                        manual_review_needed = %s,
-                        approved_status = %s,
-                        has_jd_clean = %s,
-                        synced_at = NOW(),
-                        updated_at = CASE WHEN %s THEN NOW() ELSE updated_at END
-                    WHERE job_id = %s
-                    """,
-                    (
-                        source_id,
-                        job["source"],
-                        merged.get("title"),
-                        merged.get("company"),
-                        merged.get("location"),
-                        merged.get("job_type"),
-                        merged.get("job_url"),
-                        merged.get("apply_url"),
-                        merged.get("ingest_profile"),
-                        merged.get("date_posted"),
-                        merged.get("salary_min"),
-                        merged.get("salary_max"),
-                        merged.get("currency"),
-                        merged.get("role_family"),
-                        merged.get("actual_role_id"),
-                        merged.get("actual_role_name"),
-                        merged.get("role_level_id"),
-                        merged.get("experience_level"),
-                        merged.get("experience_bucket"),
-                        merged.get("jd_summary"),
-                        merged.get("jd_clean"),
-                        _json(merged.get("jd_requirements")),
-                        _json(merged.get("jd_responsibilities")),
-                        _json(merged.get("required_skills")),
-                        _json(merged.get("good_to_have_skills")),
-                        _json(merged.get("tools")),
-                        _json(merged.get("programming_languages")),
-                        _json(merged.get("databases")),
-                        _json(merged.get("frameworks")),
-                        _json(merged.get("student_preparation_topics")),
-                        merged.get("mapping_confidence"),
-                        merged.get("manual_review_needed"),
-                        merged.get("approved_status"),
-                        bool(merged.get("jd_clean")),
-                        changed,
-                        job_id,
-                    ),
-                )
-                counts["reobserved"] += 1
-                counts["reobserved_ids"].append(job_id)
-                if changed:
-                    counts["updated"] += 1
-                else:
-                    counts["unchanged"] += 1
-                continue
-            job_id = allocate_job_id(conn)
-            cur.execute(
-                """
-                INSERT INTO validated_jobs (
-                    job_id, source_id, source, title, company, location, job_type,
-                    job_url, apply_url, link_status, ingest_profile, date_posted,
-                    salary_min, salary_max, currency, role_family,
-                    actual_role_id, actual_role_name, role_level_id, experience_level,
-                    experience_bucket, jd_summary, jd_clean, jd_requirements, jd_responsibilities,
-                    required_skills, good_to_have_skills, tools, programming_languages,
-                    databases, frameworks, student_preparation_topics,
-                    manual_review_needed, approved_status, mapping_confidence, has_jd_clean,
-                    scraped_created_at, synced_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, 'active', %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s, %s,
-                    NOW(), NOW(), NOW()
-                )
-                """,
-                (
-                    job_id,
-                    source_id,
-                    job["source"],
-                    job["title"],
-                    job.get("company"),
-                    job.get("location"),
-                    job.get("job_type"),
-                    job["job_url"],
-                    job.get("apply_url"),
-                    job.get("ingest_profile"),
-                    job.get("date_posted"),
-                    job.get("salary_min"),
-                    job.get("salary_max"),
-                    job.get("currency"),
-                    job.get("role_family"),
-                    job.get("actual_role_id"),
-                    job.get("actual_role_name"),
-                    job.get("role_level_id"),
-                    job.get("experience_level"),
-                    job.get("experience_bucket"),
-                    job.get("jd_summary"),
-                    job.get("jd_clean"),
-                    _json(job.get("jd_requirements")),
-                    _json(job.get("jd_responsibilities")),
-                    _json(job.get("required_skills")),
-                    _json(job.get("good_to_have_skills")),
-                    _json(job.get("tools")),
-                    _json(job.get("programming_languages")),
-                    _json(job.get("databases")),
-                    _json(job.get("frameworks")),
-                    _json(job.get("student_preparation_topics")),
-                    job.get("manual_review_needed"),
-                    job.get("approved_status"),
-                    job.get("mapping_confidence"),
-                    bool(job.get("jd_clean")),
-                ),
+    stage = "catalog_plan"
+    started = time.perf_counter()
+    try:
+        with conn.cursor() as cur:
+            apply_write_timeouts(cur)
+            by_source_id, by_url = _prefetch_existing(cur, jobs)
+            planned = _plan_rows(jobs, by_source_id, by_url)
+            new_rows = [entry for entry in planned if entry["is_new"]]
+            existing_rows = [entry for entry in planned if not entry["is_new"]]
+            if new_rows:
+                for entry, job_id in zip(new_rows, allocate_job_ids(cur, len(new_rows)), strict=True):
+                    entry["job_id"] = job_id
+            counts["catalog_plan_sec"] = round(time.perf_counter() - started, 3)
+            print(
+                f"STAGE catalog_plan existing={len(existing_rows)} new={len(new_rows)} "
+                f"elapsed={counts['catalog_plan_sec']}",
+                flush=True,
             )
-            counts["new"] += 1
-            counts["new_ids"].append(job_id)
-    conn.commit()
+            stage = "catalog_write"
+            write_started = time.perf_counter()
+            print(
+                f"STAGE catalog_write updates={len(existing_rows)} inserts={len(new_rows)} start",
+                flush=True,
+            )
+            if planned:
+                _write_resolved(cur, planned)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise SystemExit(_write_failure(exc, stage)) from None
+    counts["catalog_write_sec"] = round(time.perf_counter() - write_started, 3)
+    print(
+        f"STAGE catalog_write committed elapsed={counts['catalog_write_sec']}",
+        flush=True,
+    )
+    for entry in existing_rows:
+        counts["reobserved"] += 1
+        counts["reobserved_ids"].append(entry["job_id"])
+        if entry["content_changed"]:
+            counts["updated"] += 1
+        else:
+            counts["unchanged"] += 1
+    for entry in new_rows:
+        counts["new"] += 1
+        counts["new_ids"].append(entry["job_id"])
     return counts
 
 
