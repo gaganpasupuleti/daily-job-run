@@ -252,7 +252,12 @@ def main() -> None:
     parser.add_argument(
         "--prune",
         action="store_true",
-        help="After push, delete job-ready rows not in this push set",
+        help="After push, delete catalog rows not in this push set",
+    )
+    parser.add_argument(
+        "--confirm-target",
+        default="",
+        help="Application database as host:port/database. Required before a prune also updates application jobs. Not a DSN.",
     )
     args = parser.parse_args()
 
@@ -264,6 +269,11 @@ def main() -> None:
         raise SystemExit("CODEQUEST_DATABASE_URL / DATABASE_URL missing")
     if not dest_url:
         raise SystemExit("JOB_READY_DATABASE_URL missing")
+    app_url = (os.getenv("JOB_READY_APP_DATABASE_URL") or "").strip()
+    if args.prune and app_url:
+        from sync_job_ready_ui import assert_application_write_target
+
+        print(f"TARGET {assert_application_write_target(args.confirm_target)}", flush=True)
 
     run_id, run_started = start_push_run()
     print(f"Push run log id={run_id}", flush=True)
@@ -400,7 +410,7 @@ def main() -> None:
                 total = cur.fetchone()[0]
     except Exception as exc:
         status = "failed"
-        err = str(exc)
+        err = type(exc).__name__
         raise
     finally:
         try:
@@ -420,19 +430,16 @@ def main() -> None:
 
     print(f"Done. inserted={inserted} updated={updated} total={total}", flush=True)
     print("by_source:", by_source, flush=True)
-    if args.prune and (os.getenv("JOB_READY_APP_DATABASE_URL") or "").strip():
-        try:
-            from sync_job_ready_ui import archive_ui_jobs_not_in_catalog
+    if args.prune and app_url:
+        from sync_job_ready_ui import archive_ui_jobs_not_in_catalog
 
-            print("Syncing job-ready UI jobs table...", flush=True)
-            archive_ui_jobs_not_in_catalog()
-        except Exception as sync_exc:
-            print(f"WARNING: UI jobs sync failed: {sync_exc}", flush=True)
+        print("Syncing job-ready application jobs...", flush=True)
+        archive_ui_jobs_not_in_catalog(confirm_target=args.confirm_target)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        print("ERROR: push failed", file=sys.stderr, flush=True)
         raise
