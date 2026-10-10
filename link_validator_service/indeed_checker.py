@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 from urllib.parse import parse_qs, urlparse
@@ -12,20 +13,29 @@ import httpx
 logger = logging.getLogger(__name__)
 
 INDEED_GRAPHQL = "https://apis.indeed.com/graphql"
-INDEED_HEADERS = {
-    "Host": "apis.indeed.com",
-    "content-type": "application/json",
-    "indeed-api-key": "161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8",
-    "accept": "application/json",
-    "indeed-locale": "en-IN",
-    "indeed-co": "IN",
-    "accept-language": "en-IN,en;q=0.9",
-    "user-agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1"
-    ),
-    "indeed-app-info": "appv=193.1; appid=com.indeed.jobsearch; osv=16.6.1; os=ios; dtype=phone",
-}
+
+
+def indeed_headers() -> dict[str, str]:
+    """Build Indeed request headers. The API key stays in the environment."""
+    headers = {
+        "Host": "apis.indeed.com",
+        "content-type": "application/json",
+        "accept": "application/json",
+        "indeed-locale": "en-IN",
+        "indeed-co": "IN",
+        "accept-language": "en-IN,en;q=0.9",
+        "user-agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1"
+        ),
+        "indeed-app-info": "appv=193.1; appid=com.indeed.jobsearch; osv=16.6.1; os=ios; dtype=phone",
+    }
+    key = (os.getenv("INDEED_API_KEY") or "").strip()
+    if key:
+        headers["indeed-api-key"] = key
+    return headers
+
+
 BATCH_SIZE = 50
 
 
@@ -56,6 +66,10 @@ def batch_indeed_expired(jks: list[str]) -> dict[str, bool | None]:
     if not unique:
         return out
 
+    if not (os.getenv("INDEED_API_KEY") or "").strip():
+        logger.warning("INDEED_API_KEY is not configured")
+        return {jk: None for jk in unique}
+
     with httpx.Client(timeout=15.0, verify=False) as client:
         for i in range(0, len(unique), BATCH_SIZE):
             chunk = unique[i : i + BATCH_SIZE]
@@ -67,7 +81,7 @@ def batch_indeed_expired(jks: list[str]) -> dict[str, bool | None]:
             try:
                 resp = client.post(
                     INDEED_GRAPHQL,
-                    headers=INDEED_HEADERS,
+                    headers=indeed_headers(),
                     json={"query": query},
                 )
                 if resp.status_code != 200:
