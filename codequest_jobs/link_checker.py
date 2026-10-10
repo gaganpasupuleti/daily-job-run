@@ -27,8 +27,7 @@ INCONCLUSIVE_STATUSES = {401, 403, 408, 429, 500, 502, 503, 504}
 
 
 def _status_from_response(status_code: int) -> str:
-    if status_code in EXPIRED_STATUSES:
-        return LINK_STATUS_EXPIRED
+    # A generic HTTP miss is not a provider's explicit closed-job signal.
     if status_code in INCONCLUSIVE_STATUSES or status_code >= 500:
         return LINK_STATUS_UNKNOWN
     if status_code >= 400:

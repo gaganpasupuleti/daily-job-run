@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill naukri_scraper from CodeQuest scraped_jobs (+ enrichment families)."""
+"""LEGACY. Backfill naukri_scraper from CodeQuest scraped_jobs (+ enrichment families)."""
 
 from __future__ import annotations
 

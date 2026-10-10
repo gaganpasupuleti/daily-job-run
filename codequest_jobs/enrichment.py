@@ -1,4 +1,9 @@
-"""Rules-v1 enrichment: classify scraped_jobs → job_enrichments (ROLE_*)."""
+"""Rules-v1 role classification.
+
+classify_job_row is pure and used by the JobReady daily run.
+Database writes to job_enrichments and practice items are LEGACY and are not
+part of the daily pipeline.
+"""
 
 from __future__ import annotations
 

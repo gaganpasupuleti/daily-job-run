@@ -1,4 +1,7 @@
-"""Upsert quiz_packs + questions; attach quiz_pack_id on job_enrichments."""
+"""LEGACY. Upsert quiz_packs + questions; attach quiz_pack_id on job_enrichments.
+
+The JobReady daily pipeline does not create quizzes or practice questions.
+"""
 
 from __future__ import annotations
 

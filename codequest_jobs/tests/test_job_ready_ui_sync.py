@@ -248,7 +248,8 @@ class InvariantTests(unittest.TestCase):
                     job_id text PRIMARY KEY,
                     source text,
                     job_url text,
-                    apply_url text
+                    apply_url text,
+                    link_status text NOT NULL DEFAULT 'active'
                 )
                 """
             )

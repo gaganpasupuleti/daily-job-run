@@ -1,4 +1,7 @@
-"""Dual-write UnifiedJob rows into CodeQuest scraped_jobs (+ scrape run audit)."""
+"""LEGACY. Dual-write UnifiedJob rows into CodeQuest scraped_jobs.
+
+Not used by the JobReady daily pipeline.
+"""
 
 from __future__ import annotations
 

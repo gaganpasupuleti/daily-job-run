@@ -176,7 +176,13 @@ def _connect(url: str):
 def _fetch_catalog_ids(catalog_url: str) -> list[str]:
     with _connect(catalog_url) as src:
         with src.cursor() as cur:
-            cur.execute("SELECT job_id FROM validated_jobs WHERE job_id IS NOT NULL")
+            cur.execute(
+                """
+                SELECT job_id FROM validated_jobs
+                WHERE job_id IS NOT NULL
+                  AND link_status = 'active'
+                """
+            )
             return [row[0] for row in cur.fetchall()]
 
 

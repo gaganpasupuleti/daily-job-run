@@ -1,4 +1,7 @@
-"""Railway PostgreSQL persistence for multi-source job dumps."""
+"""LEGACY. Railway PostgreSQL persistence for the old naukri_scraper table.
+
+Not used by the JobReady daily pipeline.
+"""
 
 from __future__ import annotations
 

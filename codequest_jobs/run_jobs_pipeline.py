@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+"""LEGACY.
 CodeQuest sister-repo master pipeline.
 
 Ask Cursor: "run jobs + quizzes" → this script.
