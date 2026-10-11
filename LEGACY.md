@@ -2,6 +2,12 @@
 
 The daily command is `python codequest_jobs/run_jobready_daily.py`. These files remain so older audits can still be read. They are not part of that command.
 
+## Retired commands
+
+- `codequest_jobs/prune_job_ready_now.py` is RETIRED. It used to delete every JobReady catalog row that was not active in CodeQuest `scraped_jobs`, then reconcile application membership. Every invocation now prints `RETIRED_COMMAND prune_job_ready_now` and exits with code 2. It reads no database variable and opens no connection. No flag re-enables it. Do not use it for JobReady catalog maintenance.
+
+CodeQuest is not authoritative for JobReady catalog membership. Catalog lifecycle changes come from the JobReady collector and validator in `run_jobready_daily.py`. Application membership reconciliation is the separate guarded `codequest_jobs/sync_job_ready_ui.py`.
+
 ## CodeQuest and local scraper writes
 
 - `naukri_jobs_scraper/codequest_sync.py`
