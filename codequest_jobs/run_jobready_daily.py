@@ -221,6 +221,7 @@ def run_daily(
         sources[row["source"]] = sources.get(row["source"], 0) + 1
     upserted = upsert_jobs(catalog_conn, prepared)
     validation = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0}
+    validation_reasons: dict[str, int] = {}
     validation_started = time.perf_counter()
     if observations is not None:
         validation = apply_observations(catalog_conn, observations)
@@ -237,6 +238,9 @@ def run_daily(
         _stage(f"validation selected={len(candidates)}")
         built = validate_candidates(candidates, probes=probes)
         validation = apply_observations(catalog_conn, built)
+        for item in built:
+            label = f"{item.observation}:{item.reason}"
+            validation_reasons[label] = validation_reasons.get(label, 0) + 1
     validation_sec = round(time.perf_counter() - validation_started, 3) if observations is not None or validate else 0.0
     if observations is not None or validate:
         _stage(
@@ -283,6 +287,7 @@ def run_daily(
         "confirmed_active": validation["confirmed_active"],
         "confirmed_expired": validation["confirmed_expired"],
         "unknown_or_inconclusive": validation["inconclusive"],
+        "validation_reasons": dict(sorted(validation_reasons.items())),
         "per_source_counts": sources,
         "per_family_counts": families,
         "manual_review_count": manual_review,

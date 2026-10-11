@@ -59,8 +59,39 @@ def indeed_jk_from_url(url: str) -> str | None:
     return None
 
 
+def parse_indeed_results(payload: object, requested: list[str]) -> dict[str, bool | None]:
+    """Map each requested jk to the API's boolean expired flag, else None.
+
+    A missing, null, or non-boolean flag is unknown. Keys that were not
+    requested are ignored. A key returned twice with different flags is unknown.
+    """
+    out: dict[str, bool | None] = {jk: None for jk in requested}
+    if not isinstance(payload, dict):
+        return out
+    data = payload.get("data")
+    job_data = data.get("jobData") if isinstance(data, dict) else None
+    results = job_data.get("results") if isinstance(job_data, dict) else None
+    if not isinstance(results, list):
+        return out
+    seen: dict[str, bool | None] = {}
+    for item in results:
+        job = item.get("job") if isinstance(item, dict) else None
+        if not isinstance(job, dict):
+            continue
+        key = job.get("key")
+        if not isinstance(key, str) or key not in out:
+            continue
+        flag = job.get("expired")
+        value = flag if isinstance(flag, bool) else None
+        if key in seen and seen[key] != value:
+            value = None
+        seen[key] = value
+    out.update(seen)
+    return out
+
+
 def batch_indeed_expired(jks: list[str]) -> dict[str, bool | None]:
-    """Return jk -> expired (True/False) or None if lookup failed."""
+    """Return jk -> expired (True/False) or None if lookup failed or was ambiguous."""
     out: dict[str, bool | None] = {}
     unique = [jk for jk in dict.fromkeys(jks) if jk]
     if not unique:
@@ -89,21 +120,7 @@ def batch_indeed_expired(jks: list[str]) -> dict[str, bool | None]:
                     for jk in chunk:
                         out.setdefault(jk, None)
                     continue
-                data = resp.json()
-                results = (
-                    data.get("data", {}).get("jobData", {}).get("results") or []
-                )
-                seen: set[str] = set()
-                for item in results:
-                    job = (item or {}).get("job") or {}
-                    key = job.get("key")
-                    if not key:
-                        continue
-                    seen.add(key)
-                    out[key] = bool(job.get("expired"))
-                for jk in chunk:
-                    if jk not in seen:
-                        out[jk] = None
+                out.update(parse_indeed_results(resp.json(), chunk))
             except Exception as exc:
                 logger.warning("Indeed GraphQL batch failed: %s", exc)
                 for jk in chunk:

@@ -185,29 +185,36 @@ class ContractTests(unittest.TestCase):
 
     def test_provider_rules_are_conservative(self) -> None:
         from jobready_validator import interpret_indeed, interpret_linkedin, interpret_naukri
+        from linkedin_checker import GUEST_URL
 
         self.assertEqual(interpret_indeed(expired=True, key_configured=True)[0], "confirmed_expired")
         self.assertEqual(interpret_indeed(expired=False, key_configured=True)[0], "confirmed_active")
         self.assertEqual(interpret_indeed(expired=None, key_configured=False)[0], "inconclusive")
         self.assertEqual(interpret_indeed(expired=None, key_configured=True)[0], "inconclusive")
-        closed = interpret_linkedin(status_code=200, body="No longer accepting applications")
-        self.assertEqual(closed, ("confirmed_expired", "linkedin_closed_marker"))
-        self.assertEqual(interpret_linkedin(status_code=404, body="")[0], "confirmed_expired")
-        self.assertEqual(interpret_linkedin(status_code=410, body="")[0], "confirmed_expired")
-        self.assertEqual(interpret_linkedin(status_code=429, body="")[0], "inconclusive")
-        self.assertEqual(interpret_linkedin(status_code=503, body="")[0], "inconclusive")
-        self.assertEqual(interpret_naukri(status_code=404, payload=None)[0], "inconclusive")
-        self.assertEqual(interpret_naukri(status_code=410, payload=None)[0], "inconclusive")
-        self.assertEqual(interpret_naukri(status_code=500, payload={"error": "system"})[0], "inconclusive")
-        self.assertEqual(interpret_naukri(status_code=200, payload={"job": []})[0], "inconclusive")
+        guest = GUEST_URL.format(job_id="123")
+
+        def linkedin(status: int, body: str) -> str:
+            return interpret_linkedin(status_code=status, body=body, expected_job_id="123", final_url=guest)[0]
+
+        self.assertEqual(linkedin(200, "No longer accepting applications"), "inconclusive")
+        self.assertEqual(linkedin(404, ""), "confirmed_expired")
+        self.assertEqual(linkedin(410, ""), "confirmed_expired")
+        self.assertEqual(linkedin(429, ""), "inconclusive")
+        self.assertEqual(linkedin(503, ""), "inconclusive")
+        detail = "https://www.naukri.com/jobapi/v1/job/123"
+
+        def naukri(status: int, payload) -> str:
+            return interpret_naukri(status_code=status, payload=payload, expected_job_id="123", final_url=detail)[0]
+
+        self.assertEqual(naukri(404, None), "inconclusive")
+        self.assertEqual(naukri(410, None), "inconclusive")
+        self.assertEqual(naukri(500, {"error": "system"}), "inconclusive")
+        self.assertEqual(naukri(200, {"job": []}), "inconclusive")
         self.assertEqual(
-            interpret_naukri(status_code=200, payload={"job": {"title": "Python Developer", "jobStatus": "expired"}})[0],
+            naukri(200, {"job": {"jobId": "123", "title": "Python Developer", "jobStatus": "expired"}}),
             "confirmed_expired",
         )
-        self.assertEqual(
-            interpret_naukri(status_code=200, payload={"job": {"title": "Python Developer"}})[0],
-            "confirmed_active",
-        )
+        self.assertEqual(naukri(200, {"job": {"jobId": "123", "title": "Python Developer"}}), "inconclusive")
 
     def test_report_refuses_credentials(self) -> None:
         with self.assertRaises(SystemExit) as caught:
@@ -820,6 +827,7 @@ class CatalogTests(unittest.TestCase):
         self.reports.append(Path(report["report_path"]))
         self.assertGreater(report["validated_checked"], 0)
         self.assertEqual(report["confirmed_active"], 1)
+        self.assertEqual(report["validation_reasons"], {"confirmed_active:fixture_live": 1})
         self.assertEqual(self._row(url)[1], "active")
         self.assertIn("naukri", report["sources_successful"])
         self.assertNotIn("postgresql://", Path(report["report_path"]).read_text(encoding="utf-8").lower())
