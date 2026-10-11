@@ -71,16 +71,21 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn("will not be modified", stdout.getvalue())
 
-    def test_prune_without_flag_does_not_call_the_writer(self) -> None:
+    def test_retired_prune_does_not_call_the_writer(self) -> None:
         import prune_job_ready_now
 
         calls: list[str] = []
-        prune_job_ready_now.archive_ui_jobs_not_in_catalog = lambda **kwargs: calls.append("archive")
-        stdout = io.StringIO()
-        with redirect_stdout(stdout):
-            code = prune_job_ready_now.main([])
-        self.assertEqual(code, 0)
+        original = sync.archive_ui_jobs_not_in_catalog
+        sync.archive_ui_jobs_not_in_catalog = lambda **kwargs: calls.append("archive")
+        try:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = prune_job_ready_now.main([])
+        finally:
+            sync.archive_ui_jobs_not_in_catalog = original
+        self.assertEqual(code, 2)
         self.assertEqual(calls, [])
+        self.assertIn("RETIRED_COMMAND prune_job_ready_now", stdout.getvalue())
 
     def test_validate_links_default_does_not_sync_application_jobs(self) -> None:
         import validate_links
@@ -409,7 +414,7 @@ class InvariantTests(unittest.TestCase):
             prune_code = prune_job_ready_now.main([])
             sync_code = sync.main([])
         self.assertEqual(audit_code, 0)
-        self.assertEqual(prune_code, 0)
+        self.assertEqual(prune_code, 2)
         self.assertEqual(sync_code, 2)
         self.assertEqual(self._row(job_id), before)
         self.assertNotIn("://", stdout.getvalue())
