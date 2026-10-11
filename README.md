@@ -14,9 +14,14 @@ That command scrapes, upserts the catalog, then validates a rotating slice of `v
 
 A job found by search starts active. Seeing it in search again does not change `link_status`. An expired row stays expired until the validator returns `confirmed_active`. Only `confirmed_expired` marks a row expired. Link checks update `link_checked_at` and do not move `synced_at`.
 
-A conclusive check needs evidence for the same job. The response must come from that job's provider endpoint without a redirect elsewhere, carry the same job id, and state its status:
+A conclusive check needs evidence for the same job. The response must come from that job's provider endpoint over HTTPS on the provider's own host and default port, without a redirect elsewhere. It must carry the same job id and state its status:
 
-- LinkedIn is `confirmed_active` only when the top card has an enabled Apply action. It is `confirmed_expired` when the top card says the job is closed or the guest endpoint returns 404 or 410. A disabled or missing Apply action, a captcha or sign-in wall, a "not found" page, or closed text outside the top card is inconclusive.
+- LinkedIn reads only the visible content of the page's single top-card element. Hidden, template, and script content does not count. A job is `confirmed_active` only when the top card has a working Apply action: LinkedIn's apply-modal button, or an Apply link to a real http or https destination. It is `confirmed_expired` when the top card says the job is closed or the guest endpoint returns 404 or 410. These are inconclusive:
+  - a disabled, missing, or inert Apply action, such as a missing href, `#`, or `javascript:`;
+  - a captcha or sign-in wall;
+  - a "not found" page;
+  - closed text outside the top card;
+  - a page where the top card cannot be identified.
 - Naukri needs an explicit status field for the same job id. A title alone is inconclusive.
 - Indeed needs a true or false `expired` flag for the requested job key. A missing, null, or text value is inconclusive.
 - Google, Foundit, and other sources are inconclusive.

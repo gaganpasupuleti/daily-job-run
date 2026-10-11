@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -33,19 +35,23 @@ LINKEDIN_BLOCK_MARKERS = (
     "quick security check",
 )
 LINKEDIN_SOFT_404_MARKERS = ("page not found", "job not found")
-LINKEDIN_STATUS_START = "top-card-layout"
-LINKEDIN_STATUS_END = ("description__text", "show-more-less-html")
-LINKEDIN_PRIMARY_CTA = "top-card-layout__cta--primary"
+LINKEDIN_TOP_CARD_CLASS = "top-card-layout"
+LINKEDIN_APPLY_CLASSES = frozenset({"top-card-layout__cta--primary", "apply-button"})
+LINKEDIN_APPLY_MODALS = frozenset({"job-details-topcard-apply-modal"})
+LINKEDIN_CLOSED_CLASS = "closed-job__flavor--closed"
+LINKEDIN_SIGN_IN_PATHS = ("/login", "/signup", "/authwall", "/checkpoint", "/uas/login")
+APPLY_TEXT_RE = re.compile(r"\bapply\b", re.IGNORECASE)
 NON_RENDERED_RE = re.compile(
     r"<(script|style|template|noscript)\b.*?</\1\s*>|<!--.*?-->",
     re.IGNORECASE | re.DOTALL,
 )
-CALL_TO_ACTION_RE = re.compile(r"<(button|a)\b([^>]*)>(.*?)</\1\s*>", re.IGNORECASE | re.DOTALL)
-CLASS_RE = re.compile(r'class="([^"]*)"', re.IGNORECASE)
-TAG_RE = re.compile(r"<[^>]+>")
-DISABLED_RE = re.compile(r"\bdisabled\b", re.IGNORECASE)
+NON_RENDERED_TAGS = frozenset({"script", "style", "template", "noscript"})
+VOID_TAGS = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+)
+HIDDEN_STYLE_RE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden", re.IGNORECASE)
 
-NAUKRI_DETAIL_PATH = "/jobapi/v1/job/{job_id}"
+NAUKRI_DETAIL_URL = "https://www.naukri.com/jobapi/v1/job/{job_id}"
 NAUKRI_ID_KEYS = ("jobId", "jobid", "id")
 NAUKRI_STATUS_KEYS = ("jobStatus", "status", "applyStatus")
 NAUKRI_FLAG_KEYS = ("isExpired", "expired", "isClosed")
@@ -73,43 +79,158 @@ def interpret_indeed(*, expired: Any, key_configured: bool) -> tuple[str, str]:
     return INCONCLUSIVE, "indeed_api_error"
 
 
-def _same_endpoint(final_url: str | None, expected_url: str) -> bool:
+def _is_provider_endpoint(final_url: str | None, expected_url: str) -> bool:
+    """Same https origin and exact path as the expected job endpoint. The query may differ."""
     if not final_url:
         return False
-    final = httpx.URL(final_url)
-    expected = httpx.URL(expected_url)
-    return (final.host, final.path.rstrip("/")) == (expected.host, expected.path.rstrip("/"))
+    try:
+        final = urlsplit(final_url)
+        expected = urlsplit(expected_url)
+        port = final.port
+    except ValueError:
+        return False
+    return (
+        final.scheme == "https"
+        and expected.scheme == "https"
+        and port in (None, 443)
+        and final.username is None
+        and final.password is None
+        and final.hostname is not None
+        and final.hostname == expected.hostname
+        and final.path.rstrip("/") == expected.path.rstrip("/")
+    )
 
 
-def _linkedin_status_region(rendered: str) -> str | None:
-    """Top card only. Description, similar jobs, and hidden markup are ignored."""
-    lowered = rendered.lower()
-    start = lowered.find(LINKEDIN_STATUS_START)
-    if start < 0:
+@dataclass
+class _Action:
+    tag: str
+    attrs: dict[str, str | None]
+    text: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Node:
+    tag: str
+    hidden: bool
+    in_card: bool
+    root: bool
+    action: _Action | None
+
+
+def _hidden_attributes(attrs: dict[str, str | None]) -> bool:
+    if "hidden" in attrs:
+        return True
+    if (attrs.get("aria-hidden") or "").strip().lower() == "true":
+        return True
+    return bool(HIDDEN_STYLE_RE.search(attrs.get("style") or ""))
+
+
+class _TopCardParser(HTMLParser):
+    """Collect visible text and actions inside the LinkedIn top-card element.
+
+    Hidden subtrees (template, script, style, noscript, hidden, aria-hidden,
+    display:none, visibility:hidden) contribute nothing. The top card counts
+    only if exactly one visible top-card element exists and its own end tag
+    closes it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[_Node] = []
+        self.roots = 0
+        self.terminated = 0
+        self.overrun = False
+        self.closed_class = False
+        self.text: list[str] = []
+        self.actions: list[_Action] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        parent = self.stack[-1] if self.stack else None
+        hidden = (parent is not None and parent.hidden) or tag in NON_RENDERED_TAGS or _hidden_attributes(attributes)
+        classes = set((attributes.get("class") or "").split())
+        root = not hidden and LINKEDIN_TOP_CARD_CLASS in classes
+        if root:
+            self.roots += 1
+        in_card = (parent is not None and parent.in_card) or root
+        action = None
+        if in_card and not hidden:
+            self.closed_class = self.closed_class or LINKEDIN_CLOSED_CLASS in classes
+            if tag in ("a", "button"):
+                action = _Action(tag, attributes)
+                self.actions.append(action)
+        if tag not in VOID_TAGS:
+            self.stack.append(_Node(tag, hidden, in_card, root, action))
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index].tag == tag:
+                break
+        else:
+            return
+        if self.stack[index].root:
+            self.terminated += 1
+        if any(node.root for node in self.stack[index + 1 :]):
+            self.overrun = True
+        del self.stack[index:]
+
+    def handle_data(self, data: str) -> None:
+        node = self.stack[-1] if self.stack else None
+        if node is None or node.hidden or not node.in_card:
+            return
+        self.text.append(data)
+        for open_node in reversed(self.stack):
+            if open_node.action is not None:
+                open_node.action.text.append(data)
+                break
+
+    @property
+    def confident(self) -> bool:
+        return self.roots == 1 and self.terminated == 1 and not self.overrun
+
+
+def _actionable_href(href: str | None, page_url: str) -> bool:
+    """A real http(s) destination other than this page or a LinkedIn sign-in wall."""
+    raw = "".join((href or "").split())
+    if not raw or raw.startswith("#"):
+        return False
+    try:
+        target = urlsplit(urljoin(page_url, raw))
+    except ValueError:
+        return False
+    page = urlsplit(page_url)
+    if target.scheme not in ("http", "https") or not target.hostname:
+        return False
+    if (target.hostname, target.path.rstrip("/")) == (page.hostname, page.path.rstrip("/")):
+        return False
+    if target.hostname.endswith("linkedin.com") and target.path.startswith(LINKEDIN_SIGN_IN_PATHS):
+        return False
+    return True
+
+
+def _apply_action_state(action: _Action, page_url: str) -> str | None:
+    """Return enabled, disabled, or nonfunctional for an Apply-looking action, else None."""
+    classes = set((action.attrs.get("class") or "").split())
+    labelled = bool(APPLY_TEXT_RE.search(" ".join(action.text)))
+    recognized = bool(classes & LINKEDIN_APPLY_CLASSES)
+    if not labelled and not recognized:
         return None
-    ends = [index for index in (lowered.find(marker, start) for marker in LINKEDIN_STATUS_END) if index >= 0]
-    if not ends:
-        return None
-    return rendered[start : min(ends)]
+    if "disabled" in action.attrs or (action.attrs.get("aria-disabled") or "").strip().lower() == "true":
+        return "disabled"
+    if not (labelled and recognized):
+        return "nonfunctional"
+    if action.tag == "button":
+        return "enabled" if action.attrs.get("data-modal") in LINKEDIN_APPLY_MODALS else "nonfunctional"
+    return "enabled" if _actionable_href(action.attrs.get("href"), page_url) else "nonfunctional"
 
 
-def _linkedin_apply_state(region: str) -> str:
-    """Return enabled, disabled, or absent for the top-card Apply action."""
-    state = "absent"
-    for match in CALL_TO_ACTION_RE.finditer(region):
-        attributes = match.group(2)
-        classes = CLASS_RE.search(attributes)
-        tokens = set((classes.group(1) if classes else "").split())
-        if LINKEDIN_PRIMARY_CTA not in tokens and "apply-button" not in tokens:
-            continue
-        if "apply" not in TAG_RE.sub(" ", match.group(3)).lower():
-            continue
-        cleaned = re.sub(r'aria-disabled="false"', "", attributes, flags=re.IGNORECASE)
-        if DISABLED_RE.search(cleaned):
-            state = "disabled"
-            continue
-        return "enabled"
-    return state
+def _linkedin_apply_state(actions: list[_Action], page_url: str) -> str:
+    """Return enabled, disabled, nonfunctional, or absent for the top-card Apply actions."""
+    states = {_apply_action_state(action, page_url) for action in actions}
+    for state in ("enabled", "disabled", "nonfunctional"):
+        if state in states:
+            return state
+    return "absent"
 
 
 def interpret_linkedin(
@@ -123,7 +244,8 @@ def interpret_linkedin(
     """Interpret the LinkedIn guest job endpoint for one requested job id."""
     if error or status_code is None:
         return INCONCLUSIVE, "linkedin_connection_failure"
-    if not _same_endpoint(final_url, GUEST_URL.format(job_id=expected_job_id)):
+    endpoint = GUEST_URL.format(job_id=expected_job_id)
+    if not _is_provider_endpoint(final_url, endpoint):
         return INCONCLUSIVE, "linkedin_redirected"
     if status_code in (401, 403, 408, 429, 999) or status_code >= 500:
         return INCONCLUSIVE, f"linkedin_http_{status_code}"
@@ -143,11 +265,16 @@ def interpret_linkedin(
         return INCONCLUSIVE, "linkedin_identity_missing"
     if identities != {expected_job_id}:
         return INCONCLUSIVE, "linkedin_identity_mismatch"
-    region = _linkedin_status_region(rendered)
-    if region is None:
+    card = _TopCardParser()
+    card.feed(html)
+    card.close()
+    if card.roots == 0:
         return INCONCLUSIVE, "linkedin_no_status_region"
-    closed = any(marker in region.lower() for marker in CLOSED_MARKERS)
-    apply_state = _linkedin_apply_state(region)
+    if not card.confident:
+        return INCONCLUSIVE, "linkedin_top_card_ambiguous"
+    card_text = " ".join(" ".join(card.text).split()).lower()
+    closed = card.closed_class or any(marker in card_text for marker in CLOSED_MARKERS)
+    apply_state = _linkedin_apply_state(card.actions, endpoint)
     if closed and apply_state == "enabled":
         return INCONCLUSIVE, "linkedin_conflict"
     if closed:
@@ -156,6 +283,8 @@ def interpret_linkedin(
         return CONFIRMED_ACTIVE, "linkedin_identity_apply"
     if apply_state == "disabled":
         return INCONCLUSIVE, "linkedin_apply_disabled"
+    if apply_state == "nonfunctional":
+        return INCONCLUSIVE, "linkedin_apply_nonfunctional"
     return INCONCLUSIVE, "linkedin_no_apply_evidence"
 
 
@@ -195,7 +324,7 @@ def interpret_naukri(
         return INCONCLUSIVE, "naukri_connection_failure"
     if status_code != 200:
         return INCONCLUSIVE, f"naukri_http_{status_code}"
-    if not final_url or httpx.URL(final_url).path.rstrip("/") != NAUKRI_DETAIL_PATH.format(job_id=expected_job_id):
+    if not _is_provider_endpoint(final_url, NAUKRI_DETAIL_URL.format(job_id=expected_job_id)):
         return INCONCLUSIVE, "naukri_redirected"
     if not isinstance(payload, dict):
         return INCONCLUSIVE, "naukri_malformed"

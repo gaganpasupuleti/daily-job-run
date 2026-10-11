@@ -55,6 +55,7 @@ def linkedin_page(
     closed: bool = False,
     identity: str | None = JOB_ID,
     top: str = "",
+    between: str = "",
     after: str = "",
 ) -> str:
     identity_html = (
@@ -66,6 +67,7 @@ def linkedin_page(
         f"{CLOSED_FIGURE if closed else ''}{top}"
         f'<div class="top-card-layout__cta-container">{apply}{SAVE_BUTTON}</div>'
         "</section>"
+        f"{between}"
         '<div class="description__text description__text--rich">'
         '<div class="show-more-less-html__markup">Build Python APIs for a fresher team.</div></div>'
         f"{after}{identity_html}"
@@ -155,6 +157,179 @@ class LinkedInEvidenceTests(unittest.TestCase):
     def test_guest_endpoint_gone_for_the_same_job_is_closed(self) -> None:
         self.assertEqual(linkedin("", status=404), ("confirmed_expired", "linkedin_guest_gone"))
         self.assertEqual(linkedin("", status=410)[0], "confirmed_expired")
+
+
+def apply_anchor(href_attribute: str) -> str:
+    return f'<a class="apply-button apply-button--link top-card-layout__cta--primary"{href_attribute}> Apply </a>'
+
+
+class EndpointOriginTests(unittest.TestCase):
+    OPEN = {"job": {"jobId": NAUKRI_ID, "jobStatus": "active"}}
+    CLOSED = {"job": {"jobId": NAUKRI_ID, "jobStatus": "expired"}}
+
+    def test_naukri_wrong_host_is_not_conclusive(self) -> None:
+        for host in ("evil.example", "naukri.com.evil.example", "m.naukri.com", "naukri.com"):
+            url = f"https://{host}/jobapi/v1/job/{NAUKRI_ID}"
+            self.assertEqual(naukri(self.CLOSED, final_url=url), ("inconclusive", "naukri_redirected"), host)
+        userinfo = f"https://www.naukri.com@evil.example/jobapi/v1/job/{NAUKRI_ID}"
+        self.assertEqual(naukri(self.OPEN, final_url=userinfo), ("inconclusive", "naukri_redirected"))
+
+    def test_naukri_plain_http_is_not_conclusive(self) -> None:
+        url = f"http://www.naukri.com/jobapi/v1/job/{NAUKRI_ID}"
+        self.assertEqual(naukri(self.OPEN, final_url=url), ("inconclusive", "naukri_redirected"))
+
+    def test_naukri_unexpected_port_is_not_conclusive(self) -> None:
+        for port in ("8443", "80", "abc"):
+            url = f"https://www.naukri.com:{port}/jobapi/v1/job/{NAUKRI_ID}"
+            self.assertEqual(naukri(self.OPEN, final_url=url), ("inconclusive", "naukri_redirected"), port)
+
+    def test_linkedin_plain_http_is_not_conclusive(self) -> None:
+        url = GUEST.replace("https://", "http://", 1)
+        self.assertEqual(linkedin(linkedin_page(), final_url=url), ("inconclusive", "linkedin_redirected"))
+        self.assertEqual(linkedin("", status=404, final_url=url), ("inconclusive", "linkedin_redirected"))
+
+    def test_linkedin_unexpected_port_is_not_conclusive(self) -> None:
+        url = GUEST.replace("www.linkedin.com", "www.linkedin.com:8443", 1)
+        self.assertEqual(linkedin(linkedin_page(), final_url=url), ("inconclusive", "linkedin_redirected"))
+
+    def test_linkedin_other_origin_or_generic_page_is_not_conclusive(self) -> None:
+        for url in (
+            GUEST.replace("www.linkedin.com", "evil.example", 1),
+            GUEST.replace("https://www.linkedin.com", "https://www.linkedin.com@evil.example", 1),
+            "https://www.linkedin.com/",
+            "https://www.linkedin.com/jobs",
+        ):
+            self.assertEqual(linkedin(linkedin_page(), final_url=url), ("inconclusive", "linkedin_redirected"), url)
+
+    def test_correct_linkedin_endpoint_is_evaluated_normally(self) -> None:
+        for url in (GUEST, f"{GUEST}?trk=public_jobs", GUEST.replace("www.linkedin.com", "www.linkedin.com:443", 1)):
+            self.assertEqual(linkedin(linkedin_page(), final_url=url), ("confirmed_active", "linkedin_identity_apply"), url)
+            self.assertEqual(linkedin(linkedin_page(closed=True, apply=""), final_url=url)[0], "confirmed_expired", url)
+
+    def test_correct_naukri_endpoint_with_open_status_is_active(self) -> None:
+        self.assertEqual(naukri(self.OPEN), ("confirmed_active", "naukri_explicit_open"))
+        bare = f"https://www.naukri.com/jobapi/v1/job/{NAUKRI_ID}"
+        self.assertEqual(naukri(self.OPEN, final_url=bare), ("confirmed_active", "naukri_explicit_open"))
+
+    def test_correct_naukri_endpoint_with_closed_status_is_expired(self) -> None:
+        self.assertEqual(naukri(self.CLOSED), ("confirmed_expired", "naukri_explicit_closed"))
+
+
+class FunctionalApplyTests(unittest.TestCase):
+    def assert_nonfunctional(self, apply: str) -> None:
+        self.assertEqual(linkedin(linkedin_page(apply=apply)), ("inconclusive", "linkedin_apply_nonfunctional"), apply)
+
+    def test_anchor_without_href_is_not_open(self) -> None:
+        self.assert_nonfunctional(apply_anchor(""))
+
+    def test_anchor_with_empty_href_is_not_open(self) -> None:
+        self.assert_nonfunctional(apply_anchor(' href=""'))
+        self.assert_nonfunctional(apply_anchor(' href="   "'))
+
+    def test_anchor_with_hash_href_is_not_open(self) -> None:
+        self.assert_nonfunctional(apply_anchor(' href="#"'))
+        self.assert_nonfunctional(apply_anchor(' href="#apply"'))
+
+    def test_anchor_with_javascript_href_is_not_open(self) -> None:
+        self.assert_nonfunctional(apply_anchor(' href="javascript:void(0)"'))
+        self.assert_nonfunctional(apply_anchor(' href=" JavaScript:void(0)"'))
+
+    def test_anchor_with_inert_destination_is_not_open(self) -> None:
+        for href in ("about:blank", "data:text/html,apply", "mailto:jobs@example.test", GUEST, "?trk=x"):
+            self.assert_nonfunctional(apply_anchor(f' href="{href}"'))
+        for href in ("https://www.linkedin.com/login?session_redirect=x", "https://www.linkedin.com/signup/cold-join"):
+            self.assert_nonfunctional(apply_anchor(f' href="{href}"'))
+
+    def test_disabled_apply_button_is_not_open(self) -> None:
+        self.assertEqual(linkedin(linkedin_page(apply=DISABLED_APPLY_BUTTON)), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_aria_disabled_apply_button_is_not_open(self) -> None:
+        aria = APPLY_BUTTON.replace("<button ", '<button aria-disabled="TRUE" ', 1)
+        self.assertEqual(linkedin(linkedin_page(apply=aria)), ("inconclusive", "linkedin_apply_disabled"))
+        anchor = apply_anchor(' href="https://careers.example.test/apply" aria-disabled="true"')
+        self.assertEqual(linkedin(linkedin_page(apply=anchor)), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_recognized_linkedin_apply_button_is_open(self) -> None:
+        self.assertEqual(linkedin(linkedin_page()), ("confirmed_active", "linkedin_identity_apply"))
+        enabled = APPLY_BUTTON.replace("<button ", '<button aria-disabled="false" ', 1)
+        self.assertEqual(linkedin(linkedin_page(apply=enabled))[0], "confirmed_active")
+
+    def test_apply_button_without_recognized_action_is_not_open(self) -> None:
+        self.assert_nonfunctional(APPLY_BUTTON.replace(' data-modal="job-details-topcard-apply-modal"', "", 1))
+        self.assert_nonfunctional(APPLY_BUTTON.replace("job-details-topcard-apply-modal", "share-modal", 1))
+        self.assert_nonfunctional('<button data-modal="job-details-topcard-apply-modal"> Apply </button>')
+        self.assert_nonfunctional('<a href="https://careers.example.test/apply"> Apply now </a>')
+        self.assert_nonfunctional(APPLY_BUTTON.replace(" Apply ", " Continue ", 1))
+
+    def test_offsite_http_or_https_apply_anchor_is_open(self) -> None:
+        for href in (
+            "https://careers.example.test/apply?id=1",
+            "http://careers.example.test/apply",
+            "/jobs/view/externalApply/4475277813",
+        ):
+            self.assertEqual(
+                linkedin(linkedin_page(apply=apply_anchor(f' href="{href}"'))),
+                ("confirmed_active", "linkedin_identity_apply"),
+                href,
+            )
+
+    def test_closed_marker_with_nonfunctional_apply_is_closed(self) -> None:
+        page = linkedin_page(closed=True, apply=apply_anchor(' href="#"'))
+        self.assertEqual(linkedin(page), ("confirmed_expired", "linkedin_closed_marker"))
+
+
+class TopCardScopeTests(unittest.TestCase):
+    def test_apply_outside_top_card_is_not_open(self) -> None:
+        for place in ("between", "after"):
+            page = linkedin_page(apply="", **{place: f"<div>{APPLY_BUTTON}</div>"})
+            self.assertEqual(linkedin(page), ("inconclusive", "linkedin_no_apply_evidence"), place)
+
+    def test_hidden_apply_inside_top_card_is_not_open(self) -> None:
+        for wrapper in ("<div hidden>", '<div style="display: none">', '<div style="visibility:hidden">'):
+            page = linkedin_page(apply=f"{wrapper}{APPLY_BUTTON}</div>")
+            self.assertEqual(linkedin(page), ("inconclusive", "linkedin_no_apply_evidence"), wrapper)
+        self.assertEqual(linkedin(linkedin_page(apply=APPLY_BUTTON.replace("<button ", "<button hidden ", 1)))[0], "inconclusive")
+
+    def test_aria_hidden_apply_inside_top_card_is_not_open(self) -> None:
+        page = linkedin_page(apply=f'<div aria-hidden="true">{APPLY_BUTTON}</div>')
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_no_apply_evidence"))
+        hidden_label = APPLY_BUTTON.replace(" Apply ", ' <span aria-hidden="true">Apply</span> ', 1)
+        self.assertEqual(linkedin(linkedin_page(apply=hidden_label)), ("inconclusive", "linkedin_apply_nonfunctional"))
+
+    def test_apply_inside_template_or_script_is_not_open(self) -> None:
+        for wrapper, closing in (("<template>", "</template>"), ("<noscript>", "</noscript>"), ("<script>var x = '", "';</script>")):
+            page = linkedin_page(apply=f"{wrapper}{APPLY_BUTTON}{closing}")
+            self.assertEqual(linkedin(page), ("inconclusive", "linkedin_no_apply_evidence"), wrapper)
+
+    def test_closed_marker_outside_top_card_does_not_expire(self) -> None:
+        self.assertEqual(linkedin(linkedin_page(between=CLOSED_FIGURE)), ("confirmed_active", "linkedin_identity_apply"))
+        self.assertEqual(linkedin(linkedin_page(apply="", between=CLOSED_FIGURE)), ("inconclusive", "linkedin_no_apply_evidence"))
+        hidden = f'<div aria-hidden="true">{CLOSED_FIGURE}</div>'
+        self.assertEqual(linkedin(linkedin_page(top=hidden)), ("confirmed_active", "linkedin_identity_apply"))
+
+    def test_top_card_closed_marker_without_functional_apply_is_closed(self) -> None:
+        self.assertEqual(linkedin(linkedin_page(closed=True, apply="")), ("confirmed_expired", "linkedin_closed_marker"))
+        text_only = '<p class="topcard__flavor">No longer\n   accepting applications</p>'
+        self.assertEqual(linkedin(linkedin_page(apply="", top=text_only)), ("confirmed_expired", "linkedin_closed_marker"))
+
+    def test_top_card_functional_apply_without_closure_is_open(self) -> None:
+        nested = APPLY_BUTTON.replace(" Apply ", " <span>Apply</span> ", 1)
+        self.assertEqual(linkedin(linkedin_page(apply=nested)), ("confirmed_active", "linkedin_identity_apply"))
+
+    def test_top_card_with_closure_and_functional_apply_is_a_conflict(self) -> None:
+        self.assertEqual(linkedin(linkedin_page(closed=True)), ("inconclusive", "linkedin_conflict"))
+
+    def test_unclear_top_card_boundary_is_not_conclusive(self) -> None:
+        second = '<section class="top-card-layout">Another job</section>'
+        self.assertEqual(linkedin(linkedin_page(after=second)), ("inconclusive", "linkedin_top_card_ambiguous"))
+        unterminated = linkedin_page().replace("</section>", "", 1)
+        self.assertEqual(linkedin(unterminated), ("inconclusive", "linkedin_top_card_ambiguous"))
+        overrun = f'<main>{linkedin_page().replace("</section>", "</main>", 1)}'
+        self.assertEqual(linkedin(overrun), ("inconclusive", "linkedin_top_card_ambiguous"))
+
+    def test_hidden_top_card_copy_is_ignored(self) -> None:
+        copy = f'<template><section class="top-card-layout">{CLOSED_FIGURE}</section></template>'
+        self.assertEqual(linkedin(linkedin_page(after=copy)), ("confirmed_active", "linkedin_identity_apply"))
 
 
 class NaukriEvidenceTests(unittest.TestCase):
