@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from jobready_catalog import (  # noqa: E402
     catalog_url,
     connect,
     identity_duplicates,
+    release_read_transaction,
     schema_problems,
     select_validation_candidates,
     upsert_jobs,
@@ -44,6 +46,10 @@ OUTPUT_DIR = ROOT / "output"
 
 def _stamp(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def _stage(message: str) -> None:
+    print(f"STAGE {message}", flush=True)
 
 
 def prepare_catalog_row(job) -> dict:
@@ -215,8 +221,10 @@ def run_daily(
         sources[row["source"]] = sources.get(row["source"], 0) + 1
     upserted = upsert_jobs(catalog_conn, prepared)
     validation = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0}
+    validation_started = time.perf_counter()
     if observations is not None:
         validation = apply_observations(catalog_conn, observations)
+        _stage(f"validation selected={validation['checked']}")
     elif validate:
         priority = _priority_ids(catalog_conn, upserted)
         candidates = select_validation_candidates(
@@ -225,8 +233,18 @@ def run_daily(
             full_audit=full_audit,
             priority_ids=priority,
         )
+        release_read_transaction(catalog_conn)
+        _stage(f"validation selected={len(candidates)}")
         built = validate_candidates(candidates, probes=probes)
         validation = apply_observations(catalog_conn, built)
+    validation_sec = round(time.perf_counter() - validation_started, 3) if observations is not None or validate else 0.0
+    if observations is not None or validate:
+        _stage(
+            f"validation complete checked={validation['checked']} "
+            f"confirmed_active={validation['confirmed_active']} "
+            f"confirmed_expired={validation['confirmed_expired']} "
+            f"inconclusive={validation['inconclusive']} elapsed={validation_sec}"
+        )
     totals = catalog_counts(catalog_conn)
     health = source_health or {}
     warning = suspicious_run(len(prepared), source_errors or [], sources_attempted or [], health)
@@ -276,8 +294,15 @@ def run_daily(
         "lock_held": hold_lock is not None,
         "validation_limit": None if full_audit else validation_limit,
         "full_audit": full_audit,
+        "catalog_plan_sec": upserted.get("catalog_plan_sec", 0.0),
+        "catalog_write_sec": upserted.get("catalog_write_sec", 0.0),
+        "validation_sec": validation_sec,
     }
     report["report_path"] = str(write_report(report))
+    _stage(
+        f"report new={report['new_catalog_jobs']} updated={report['updated_catalog_jobs']} "
+        f"unchanged={report['unchanged_catalog_jobs']}"
+    )
     return report
 
 
@@ -380,12 +405,18 @@ def execute_daily(args: argparse.Namespace, *, collect=None, probes=None) -> dic
         problems = schema_problems(conn)
         if problems:
             raise SystemExit("SCHEMA_REQUIRED " + "; ".join(problems))
+        release_read_transaction(conn)
+        scrape_started = time.perf_counter()
         scraped = collector(
             sources=args.sources,
             max_pages=args.max_pages,
             results_wanted=args.results_wanted,
             hours_old=args.hours_old,
             write_json=collect is None,
+        )
+        _stage(
+            f"scrape complete jobs={len(scraped.jobs)} "
+            f"elapsed={round(time.perf_counter() - scrape_started, 3)}"
         )
         if args.sync_application:
             from sync_job_ready_ui import _app_url, _connect
