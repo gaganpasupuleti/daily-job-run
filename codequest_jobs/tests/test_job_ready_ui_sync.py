@@ -408,6 +408,19 @@ class InvariantTests(unittest.TestCase):
 
         job_id = self._insert_job("CQJ-READONLY", "active", True)
         before = self._row(job_id)
+        with self.catalog.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO validated_jobs (job_id, source, job_url, link_status) VALUES (%s, 'foundit', %s, %s)",
+                [
+                    ("CQJ-AUDIT-ACTIVE", "https://www.foundit.in/job/a-1", "active"),
+                    ("CQJ-AUDIT-EXPIRED", "https://www.foundit.in/job/e-2", "expired"),
+                ],
+            )
+        self.catalog.commit()
+        catalog_query = "SELECT job_id, source, job_url, apply_url, link_status FROM validated_jobs ORDER BY job_id"
+        with self.catalog.cursor() as cur:
+            cur.execute(catalog_query)
+            catalog_before = cur.fetchall()
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             audit_code = audit_job_ready.main([])
@@ -417,7 +430,15 @@ class InvariantTests(unittest.TestCase):
         self.assertEqual(prune_code, 2)
         self.assertEqual(sync_code, 2)
         self.assertEqual(self._row(job_id), before)
-        self.assertNotIn("://", stdout.getvalue())
+        with self.catalog.cursor() as cur:
+            cur.execute(catalog_query)
+            self.assertEqual(cur.fetchall(), catalog_before)
+        output = stdout.getvalue()
+        self.assertIn('"confirmed_active": 0', output)
+        self.assertIn('"inconclusive": 2', output)
+        self.assertIn('"persisted_active": 1', output)
+        self.assertIn('"persisted_expired": 1', output)
+        self.assertNotIn("://", output)
 
     def test_catalog_database_cannot_be_the_application_target(self) -> None:
         previous_app = os.environ["JOB_READY_APP_DATABASE_URL"]
