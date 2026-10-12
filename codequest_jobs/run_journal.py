@@ -104,10 +104,10 @@ def _secret_values() -> list[str]:
 
 def sanitize_text(value: Any, limit: int = STRING_LIMIT) -> str:
     text = str(value)
-    for secret in _secret_values():
-        text = text.replace(secret, REDACTED)
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
+    for secret in _secret_values():
+        text = text.replace(secret, REDACTED)
     lowered = text.lower()
     if any(token in lowered for token in _FORBIDDEN):
         return REDACTED

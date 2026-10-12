@@ -621,6 +621,12 @@ class JournalUnitTests(unittest.TestCase):
             for secret in SENTINELS:
                 self.assertNotIn(secret.lower(), text, case)
 
+    def test_sanitize_patterns_win_over_short_environment_secrets(self) -> None:
+        with patch.dict(os.environ, {"POSTGRES_PASSWORD": "postgres"}):
+            text = run_journal.sanitize_text(f"x postgres://u:{SENTINEL_PASSWORD}@h/db y").lower()
+        self.assertNotIn(SENTINEL_PASSWORD.lower(), text)
+        self.assertNotIn("://", text)
+
     def test_sanitize_redacts_environment_secret_values(self) -> None:
         with patch.dict(os.environ, {"RAILWAY_TOKEN": SENTINEL_TOKEN, "JOB_READY_APP_DATABASE_URL": SENTINEL_DSN}):
             text = run_journal.sanitize_text(f"x {SENTINEL_TOKEN} y {SENTINEL_PASSWORD} z")
