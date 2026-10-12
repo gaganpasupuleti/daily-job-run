@@ -417,44 +417,112 @@ class MockedRunTests(unittest.TestCase):
         self.assertEqual(journal["stages"]["report"]["failure_code"], "REPORT_REFUSED")
         self.assertIs(journal["stages"]["validation_write"]["committed"], True)
 
-    def test_lock_held_fails_preflight_and_leaves_other_journal_alone(self) -> None:
-        other = run_journal.RunJournal.start(self.runs, run={"command": "run_jobready_daily"})
-        other.begin("scrape")
+    def _lock_owner_journal(self, stage: str = "catalog_write") -> run_journal.RunJournal:
+        """A previous run that took the lock, then died while a stage was running."""
+        owner = run_journal.RunJournal.start(self.runs, run={"command": "run_jobready_daily"})
+        owner.begin("preflight")
+        owner.record_lock_acquired()
+        owner.complete("preflight")
+        owner.begin(stage)
+        return owner
+
+    def _pending_journal(self) -> run_journal.RunJournal:
+        """A live contender: journal created, preflight running, lock not yet acquired."""
+        pending = run_journal.RunJournal.start(self.runs, run={"command": "run_jobready_daily"})
+        pending.begin("preflight")
+        return pending
+
+    def _current_journal(self, *others: run_journal.RunJournal) -> dict:
+        excluded = {other.path for other in others}
+        current = [path for path in self.runs.glob("*.json") if path not in excluded]
+        self.assertEqual(len(current), 1)
+        return json.loads(current[0].read_text(encoding="utf-8"))
+
+    # OPS-02 follow-up 3
+    def test_lock_held_fails_preflight_and_modifies_no_other_journal(self) -> None:
+        owner = self._lock_owner_journal()
+        pending = self._pending_journal()
+        before = {path: path.read_bytes() for path in (owner.path, pending.path)}
         self.fail_at = "lock"
         self.failure = SystemExit("another JobReady daily run is active")
         with self.assertRaises(SystemExit):
             self.run_command()
-        mine = [path for path in self.runs.glob("*.json") if path != other.path]
-        self.assertEqual(len(mine), 1)
-        journal = json.loads(mine[0].read_text(encoding="utf-8"))
+        journal = self._current_journal(owner, pending)
         self.assert_failed_run(journal, "preflight")
+        self.assertEqual(journal["failure_code"], "RUN_LOCK_HELD")
         self.assertEqual(journal["stages"]["preflight"]["failure_code"], "RUN_LOCK_HELD")
+        self.assertIsNone(journal["lock_acquired_at"])
+        self.assertEqual(journal["abandoned_previous"], [])
         self.assertEqual(journal["stages"]["scrape"]["status"], "not_started")
-        still_running = json.loads(other.path.read_text(encoding="utf-8"))
-        self.assertEqual(still_running["terminal_state"], "running")
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content, path.name)
 
-    def test_previous_running_journal_is_abandoned_after_lock(self) -> None:
-        other = run_journal.RunJournal.start(self.runs, run={"command": "run_jobready_daily"})
-        other.begin("catalog_write")
+    # OPS-02 follow-up 1
+    def test_previous_lock_owner_is_abandoned_after_lock(self) -> None:
+        owner = self._lock_owner_journal()
         done = run_journal.RunJournal.start(self.runs, run={"command": "run_jobready_daily"})
         for name in run_journal.STAGES:
             done.skip(name, "fixture")
         done.finish_completed(report_path=None)
+        done_before = done.path.read_bytes()
+        self.writes.clear()
         self.run_command()
-        previous = json.loads(other.path.read_text(encoding="utf-8"))
+        previous = json.loads(owner.path.read_text(encoding="utf-8"))
         self.assertEqual(previous["terminal_state"], "abandoned")
+        self.assertIsNotNone(previous["lock_acquired_at"])
         self.assertEqual(previous["stages"]["catalog_write"]["status"], "failed")
         self.assertEqual(previous["stages"]["catalog_write"]["failure_code"], "RUN_ABANDONED")
         self.assertIsNone(previous["stages"]["catalog_write"]["committed"])
-        self.assertEqual(json.loads(done.path.read_text(encoding="utf-8"))["terminal_state"], "completed")
-        current = [
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in self.runs.glob("*.json")
-            if path not in (other.path, done.path)
-        ]
-        self.assertEqual(len(current), 1)
-        self.assertEqual(current[0]["abandoned_previous"], [other.run_id])
-        self.assertEqual(previous["abandoned_detected_by"], current[0]["run_id"])
+        self.assertEqual(previous["failed_stage"], "catalog_write")
+        self.assertEqual(done.path.read_bytes(), done_before)
+        current = self._current_journal(owner, done)
+        self.assertEqual(current["abandoned_previous"], [owner.run_id])
+        self.assertEqual(previous["abandoned_detected_by"], current["run_id"])
+
+        written = [json.loads(text) for text in self.writes]
+        lock_evidence = next(
+            index for index, data in enumerate(written)
+            if data["run_id"] == current["run_id"] and data["lock_acquired_at"]
+        )
+        reclassified = next(
+            index for index, data in enumerate(written)
+            if data["run_id"] == owner.run_id and data["terminal_state"] == "abandoned"
+        )
+        self.assertLess(lock_evidence, reclassified, "lock evidence must be persisted before the scan")
+        self.assertIsNone(written[lock_evidence]["stages"]["scrape"]["started_at"])
+
+    # OPS-02 follow-up 2
+    def test_pending_journal_without_lock_evidence_is_not_abandoned(self) -> None:
+        pending = self._pending_journal()
+        before = pending.path.read_bytes()
+        self.run_command()
+        self.assertEqual(pending.path.read_bytes(), before)
+        self.assertEqual(json.loads(before)["terminal_state"], "running")
+        current = self._current_journal(pending)
+        self.assertEqual(current["terminal_state"], "completed")
+        self.assertEqual(current["abandoned_previous"], [])
+        self.assertEqual(current["stages"]["preflight"]["counters"]["abandoned_previous"], 0)
+
+    def test_only_lock_owners_are_abandoned_when_both_exist(self) -> None:
+        owner = self._lock_owner_journal("validation_probe")
+        pending = self._pending_journal()
+        pending_before = pending.path.read_bytes()
+        self.run_command()
+        self.assertEqual(json.loads(owner.path.read_text(encoding="utf-8"))["terminal_state"], "abandoned")
+        self.assertEqual(pending.path.read_bytes(), pending_before)
+        self.assertEqual(self._current_journal(owner, pending)["abandoned_previous"], [owner.run_id])
+
+    # OPS-02 follow-up 4
+    def test_successful_run_persists_lock_evidence(self) -> None:
+        self.run_command()
+        journal = _only_journal(self.runs)[1]
+        self.assertEqual(journal["terminal_state"], "completed")
+        self.assertIsNotNone(journal["lock_acquired_at"])
+        self.assertLessEqual(journal["started_at"], journal["lock_acquired_at"])
+        self.assertLessEqual(journal["lock_acquired_at"], journal["stages"]["preflight"]["finished_at"])
+        events = dict(self.events)
+        self.assertIsNone(events["lock"]["lock_acquired_at"], "evidence is written only after the lock is held")
+        self.assertIsNotNone(events["scrape"]["lock_acquired_at"])
 
     # 13
     def test_no_dsn_or_sentinel_credentials_in_journal(self) -> None:
@@ -591,6 +659,18 @@ class JournalUnitTests(unittest.TestCase):
         self.assertEqual(record["failure_code"], "CATALOG_WRITE_FAILED")
         self.assertEqual(record["failure_message"], "ValueError: bad row")
         self.assertIsNotNone(record["elapsed_sec"])
+
+    def test_abandon_scan_requires_current_lock_evidence(self) -> None:
+        owner = run_journal.RunJournal.start(self.dir, run={}, git_commit=None)
+        owner.record_lock_acquired()
+        owner.begin("scrape")
+        before = owner.path.read_bytes()
+        current = run_journal.RunJournal.start(self.dir, run={}, git_commit=None)
+        with self.assertRaises(RuntimeError):
+            current.mark_abandoned_previous()
+        self.assertEqual(owner.path.read_bytes(), before)
+        current.record_lock_acquired()
+        self.assertEqual(current.mark_abandoned_previous(), [owner.run_id])
 
     def test_disabled_journal_never_writes(self) -> None:
         journal = run_journal.RunJournal.disabled()

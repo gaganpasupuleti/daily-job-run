@@ -487,6 +487,7 @@ def execute_daily(args: argparse.Namespace, *, collect=None, probes=None, journa
             except SystemExit:
                 print("another JobReady daily run is active", flush=True)
                 raise
+            journal.record_lock_acquired()
             stage.counters["abandoned_previous"] = len(journal.mark_abandoned_previous())
             conn = _open_catalog()
             problems = schema_problems(conn)

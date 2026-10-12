@@ -245,6 +245,7 @@ class RunJournal:
             **run,
             "pid": os.getpid(),
             "started_at": _iso(started),
+            "lock_acquired_at": None,
             "finished_at": None,
             "elapsed_sec": None,
             "terminal_state": "running",
@@ -373,13 +374,23 @@ class RunJournal:
         self._finish("failed")
         self.write()
 
-    def mark_abandoned_previous(self) -> list[str]:
-        """Call only while holding the daily run lock.
+    def record_lock_acquired(self) -> None:
+        """Persist that this run holds the canonical daily-run lock."""
+        self.data["lock_acquired_at"] = _iso(_now())
+        self.write()
 
-        Another journal still in "running" then belongs to a process that died
-        without finishing. A stage that was running is marked failed with
-        committed=null: whether its transaction committed is unknown.
+    def mark_abandoned_previous(self) -> list[str]:
+        """Reclassify dead lock owners. Requires record_lock_acquired() first.
+
+        A previous journal is abandoned only when it is still "running" and
+        recorded lock_acquired_at. That run held the lock, and this run now
+        holds it, so the earlier process ended without finishing. A running
+        journal without lock_acquired_at may be a live contender that has not
+        reached the lock yet; it is left untouched. A stage that was running is
+        marked failed with committed=null: whether it committed is unknown.
         """
+        if not self.data["lock_acquired_at"]:
+            raise RuntimeError("mark_abandoned_previous requires lock_acquired_at on this run")
         if self.directory is None or not self.directory.is_dir():
             return []
         abandoned: list[str] = []
@@ -391,6 +402,8 @@ class RunJournal:
             except (OSError, ValueError):
                 continue
             if not isinstance(data, dict) or data.get("terminal_state") != "running":
+                continue
+            if not data.get("lock_acquired_at"):
                 continue
             moment = _iso(_now())
             data["terminal_state"] = "abandoned"
