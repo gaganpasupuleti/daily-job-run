@@ -105,7 +105,9 @@ def _is_provider_endpoint(final_url: str | None, expected_url: str) -> bool:
 class _Action:
     tag: str
     attrs: dict[str, str | None]
+    inherited_disabled: bool
     text: list[str] = field(default_factory=list)
+    closed: bool = False
 
 
 @dataclass
@@ -114,6 +116,7 @@ class _Node:
     hidden: bool
     in_card: bool
     root: bool
+    disabled: bool
     action: _Action | None
 
 
@@ -125,13 +128,23 @@ def _hidden_attributes(attrs: dict[str, str | None]) -> bool:
     return bool(HIDDEN_STYLE_RE.search(attrs.get("style") or ""))
 
 
+def _aria_disabled(attrs: dict[str, str | None]) -> bool:
+    return (attrs.get("aria-disabled") or "").strip().lower() == "true"
+
+
+def _disables_descendants(tag: str, attrs: dict[str, str | None]) -> bool:
+    """A disabled fieldset or an aria-disabled element disables everything inside it."""
+    return (tag == "fieldset" and "disabled" in attrs) or _aria_disabled(attrs)
+
+
 class _TopCardParser(HTMLParser):
     """Collect visible text and actions inside the LinkedIn top-card element.
 
     Hidden subtrees (template, script, style, noscript, hidden, aria-hidden,
     display:none, visibility:hidden) contribute nothing. The top card counts
     only if exactly one visible top-card element exists and its own end tag
-    closes it.
+    closes it. Likewise an action is closed only by its own end tag, and it
+    inherits the disabled state of any disabled ancestor.
     """
 
     def __init__(self) -> None:
@@ -153,14 +166,16 @@ class _TopCardParser(HTMLParser):
         if root:
             self.roots += 1
         in_card = (parent is not None and parent.in_card) or root
+        inherited_disabled = parent is not None and parent.disabled
+        disabled = inherited_disabled or _disables_descendants(tag, attributes)
         action = None
         if in_card and not hidden:
             self.closed_class = self.closed_class or LINKEDIN_CLOSED_CLASS in classes
             if tag in ("a", "button"):
-                action = _Action(tag, attributes)
+                action = _Action(tag, attributes, inherited_disabled)
                 self.actions.append(action)
         if tag not in VOID_TAGS:
-            self.stack.append(_Node(tag, hidden, in_card, root, action))
+            self.stack.append(_Node(tag, hidden, in_card, root, disabled, action))
 
     def handle_endtag(self, tag: str) -> None:
         for index in range(len(self.stack) - 1, -1, -1):
@@ -168,6 +183,8 @@ class _TopCardParser(HTMLParser):
                 break
         else:
             return
+        if self.stack[index].action is not None:
+            self.stack[index].action.closed = True
         if self.stack[index].root:
             self.terminated += 1
         if any(node.root for node in self.stack[index + 1 :]):
@@ -209,13 +226,15 @@ def _actionable_href(href: str | None, page_url: str) -> bool:
 
 
 def _apply_action_state(action: _Action, page_url: str) -> str | None:
-    """Return enabled, disabled, or nonfunctional for an Apply-looking action, else None."""
+    """Return malformed, enabled, disabled, or nonfunctional for an Apply-looking action, else None."""
     classes = set((action.attrs.get("class") or "").split())
     labelled = bool(APPLY_TEXT_RE.search(" ".join(action.text)))
     recognized = bool(classes & LINKEDIN_APPLY_CLASSES)
     if not labelled and not recognized:
         return None
-    if "disabled" in action.attrs or (action.attrs.get("aria-disabled") or "").strip().lower() == "true":
+    if not action.closed:
+        return "malformed"
+    if action.inherited_disabled or "disabled" in action.attrs or _aria_disabled(action.attrs):
         return "disabled"
     if not (labelled and recognized):
         return "nonfunctional"
@@ -225,9 +244,9 @@ def _apply_action_state(action: _Action, page_url: str) -> str | None:
 
 
 def _linkedin_apply_state(actions: list[_Action], page_url: str) -> str:
-    """Return enabled, disabled, nonfunctional, or absent for the top-card Apply actions."""
+    """Return malformed, enabled, disabled, nonfunctional, or absent for the top-card Apply actions."""
     states = {_apply_action_state(action, page_url) for action in actions}
-    for state in ("enabled", "disabled", "nonfunctional"):
+    for state in ("malformed", "enabled", "disabled", "nonfunctional"):
         if state in states:
             return state
     return "absent"
@@ -279,6 +298,8 @@ def interpret_linkedin(
         return INCONCLUSIVE, "linkedin_conflict"
     if closed:
         return CONFIRMED_EXPIRED, "linkedin_closed_marker"
+    if apply_state == "malformed":
+        return INCONCLUSIVE, "linkedin_apply_malformed"
     if apply_state == "enabled":
         return CONFIRMED_ACTIVE, "linkedin_identity_apply"
     if apply_state == "disabled":

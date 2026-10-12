@@ -7,6 +7,7 @@ and JOBREADY_DAILY_APP_URL; those are skipped when the variables are absent.
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import re
@@ -106,6 +107,21 @@ class _FakeConn:
         return None
 
 
+class _CommitFailingConnection:
+    """A real connection whose commit fails without committing."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.commit_attempts = 0
+
+    def commit(self) -> None:
+        self.commit_attempts += 1
+        raise psycopg2.OperationalError("server closed the connection during commit")
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class _FakeLock:
     def __init__(self, harness: "MockedRunTests") -> None:
         self.harness = harness
@@ -130,6 +146,7 @@ class MockedRunTests(unittest.TestCase):
         self.fail_at: str | None = None
         self.failure: BaseException = RuntimeError("forced failure")
         self.source_failed = False
+        self.committed = False
         self.events: list[tuple[str, dict | None]] = []
         self.writes: list[str] = []
         self.lock = _FakeLock(self)
@@ -179,11 +196,15 @@ class MockedRunTests(unittest.TestCase):
         self.hook("scrape")
         return _scrape(["https://example.test/jobs/a", "https://example.test/jobs/b"], source_failed=self.source_failed)
 
-    def upsert(self, conn, rows, *, on_plan_complete=None) -> dict:
+    def upsert(self, conn, rows, *, on_plan_complete=None, on_commit=None) -> dict:
         self.hook("catalog_plan")
         if on_plan_complete is not None:
             on_plan_complete()
         self.hook("catalog_write")
+        self.committed = True
+        if on_commit is not None:
+            on_commit()
+        self.hook("catalog_post_commit")
         return {
             "new": len(rows),
             "updated": 0,
@@ -573,6 +594,85 @@ class MockedRunTests(unittest.TestCase):
         self.assert_failed_run(journal, "validation_probe")
         self.assertEqual(journal["failure_code"], "INTERRUPTED")
 
+    # Phase 0 closure: commit truth survives a post-commit failure
+    def test_post_commit_logging_failure_keeps_committed_true(self) -> None:
+        journal = self.run_failing("catalog_post_commit", BrokenPipeError(32, "Broken pipe"))
+        self.assertTrue(self.committed)
+        write = journal["stages"]["catalog_write"]
+        self.assertEqual(journal["terminal_state"], "failed")
+        self.assertEqual(journal["failed_stage"], "catalog_write")
+        self.assertEqual(write["status"], "failed")
+        self.assertIs(write["committed"], True)
+        for text in self.writes:
+            if json.loads(text)["run_id"] == journal["run_id"]:
+                self.assertIsNot(json.loads(text)["stages"]["catalog_write"]["committed"], False)
+
+    def test_commit_is_journaled_before_post_commit_work(self) -> None:
+        self.fail_at = "catalog_post_commit"
+        self.failure = BrokenPipeError(32, "Broken pipe")
+        with self.assertRaises(BrokenPipeError):
+            self.run_command()
+        at_failure = dict(self.events)["catalog_post_commit"]
+        self.assertEqual(at_failure["stages"]["catalog_write"]["status"], "running")
+        self.assertIs(at_failure["stages"]["catalog_write"]["committed"], True)
+
+    def test_failure_before_commit_is_not_committed(self) -> None:
+        journal = self.run_failing("catalog_write", RuntimeError("write failed before commit"))
+        self.assertFalse(self.committed)
+        self.assertIs(journal["stages"]["catalog_write"]["committed"], False)
+
+    def test_later_failure_keeps_catalog_commit(self) -> None:
+        journal = self.run_failing("validation_write", RuntimeError("later failure"))
+        self.assertIs(journal["stages"]["catalog_write"]["committed"], True)
+        self.assertEqual(journal["stages"]["catalog_write"]["status"], "completed")
+
+    # Phase 0 closure: quoted structured secrets never reach the written journal
+    def test_quoted_structured_secrets_never_reach_serialized_journal(self) -> None:
+        cases = {
+            "python_dict_repr": (ValueError({"api_key": "SYNTHETIC_QUOTED_KEY_123"}), ["SYNTHETIC_QUOTED_KEY_123"]),
+            "json_authorization": (
+                RuntimeError('{"authorization": "Bearer SYNTHETIC TOKEN VALUE"}'),
+                ["SYNTHETIC TOKEN VALUE", "SYNTHETIC", "TOKEN VALUE"],
+            ),
+            "single_quoted_password": (
+                RuntimeError("{'password': 'synthetic password with spaces'}"),
+                ["synthetic password with spaces", "password with spaces"],
+            ),
+            "compact_json_token": (RuntimeError('{"token":"abc123-secret-value"}'), ["abc123-secret-value"]),
+            "nested_json": (RuntimeError('{"error":{"api_key":"SYNTHETIC_NESTED_KEY"}}'), ["SYNTHETIC_NESTED_KEY"]),
+            "nested_repr": (ValueError({"error": {"apikey": "SYNTHETIC_NESTED_REPR"}}), ["SYNTHETIC_NESTED_REPR"]),
+            "system_exit_json": (
+                SystemExit('PROVIDER_FAILED {"api-key": "SYNTHETIC EXIT KEY", "secret": "SYNTHETIC SECRET"}'),
+                ["SYNTHETIC EXIT KEY", "SYNTHETIC SECRET"],
+            ),
+            "escaped_json": (
+                RuntimeError('payload="{\\"access_token\\": \\"SYNTHETIC ESCAPED TOKEN\\"}"'),
+                ["SYNTHETIC ESCAPED TOKEN"],
+            ),
+            "mixed_keys": (
+                RuntimeError(
+                    "{'auth_token': 'SYNTH-AUTH-1', 'passwd': 'SYNTH PASSWD 2', 'pwd': 'SYNTH-PWD-3', "
+                    "'Authorization': 'Basic SYNTHBASIC4', 'API_KEY': 'SYNTH-UPPER-5'}"
+                ),
+                ["SYNTH-AUTH-1", "SYNTH PASSWD 2", "SYNTH-PWD-3", "SYNTHBASIC4", "SYNTH-UPPER-5"],
+            ),
+        }
+        for label, (failure, secrets) in cases.items():
+            with self.subTest(label):
+                for path in self.runs.glob("*.json"):
+                    path.unlink()
+                self.writes.clear()
+                self.run_failing("validation_write", failure)
+                texts = [path.read_text(encoding="utf-8") for path in self.runs.glob("*.json")] + self.writes
+                self.assertTrue(texts)
+                for text in texts:
+                    json.loads(text)
+                    for secret in secrets:
+                        self.assertNotIn(secret, text)
+                journal = _only_journal(self.runs)[1]
+                self.assertIn("redacted", journal["stages"]["validation_write"]["failure_message"])
+                self.assertIn("redacted", journal["failure_message"])
+
 
 class JournalUnitTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -720,6 +820,53 @@ class JournalUnitTests(unittest.TestCase):
         )
         self.assertEqual(len(run_journal.failure_message(RuntimeError("x" * 2000))), run_journal.MESSAGE_LIMIT)
 
+    def test_sanitize_redacts_quoted_structured_secrets(self) -> None:
+        cases = [
+            ("{'api_key': 'SYNTHETIC_QUOTED_KEY_123'}", "SYNTHETIC_QUOTED_KEY_123"),
+            ('{"authorization": "Bearer SYNTHETIC TOKEN VALUE"}', "SYNTHETIC TOKEN VALUE"),
+            ("{'password': 'synthetic password with spaces'}", "password with spaces"),
+            ('{"token":"abc123-secret-value"}', "abc123-secret-value"),
+            ('{"error":{"api_key":"SYNTHETIC_NESTED_KEY"}}', "SYNTHETIC_NESTED_KEY"),
+            ('{"Api-Key" : "SYNTH A"}', "SYNTH A"),
+            ("{'client_secret': 'SYNTH B'}", "SYNTH B"),
+            ('{"access_token": "SYNTH \\"QUOTED\\" C"}', "QUOTED"),
+            ("password='SYNTH D with spaces'", "with spaces"),
+            ('token="SYNTH E"', "SYNTH E"),
+            ('{"token": 123456789}', "123456789"),
+        ]
+        for text, secret in cases:
+            with self.subTest(text):
+                cleaned = run_journal.sanitize_text(text)
+                self.assertNotIn(secret, cleaned)
+                self.assertIn("redacted", cleaned)
+                for token in FORBIDDEN:
+                    self.assertNotIn(token, cleaned.lower())
+
+    def test_sanitize_keeps_non_secret_keys(self) -> None:
+        text = "{'stage': 'catalog_write', 'tokens_seen': 3, 'reason': 'lock_timeout'}"
+        self.assertEqual(run_journal.sanitize_text(text), text)
+
+    def test_committed_true_is_never_downgraded(self) -> None:
+        journal = run_journal.RunJournal.start(self.dir, run={}, git_commit=None)
+        journal.begin("catalog_write")
+        journal.mark_committed("catalog_write")
+        journal.fail("catalog_write", BrokenPipeError(32, "Broken pipe"), committed=False)
+        record = json.loads(journal.path.read_text(encoding="utf-8"))["stages"]["catalog_write"]
+        self.assertEqual(record["status"], "failed")
+        self.assertIs(record["committed"], True)
+
+    def test_abandoned_stage_keeps_durable_commit(self) -> None:
+        owner = run_journal.RunJournal.start(self.dir, run={}, git_commit=None)
+        owner.record_lock_acquired()
+        owner.begin("catalog_write")
+        owner.mark_committed("catalog_write")
+        current = run_journal.RunJournal.start(self.dir, run={}, git_commit=None)
+        current.record_lock_acquired()
+        self.assertEqual(current.mark_abandoned_previous(), [owner.run_id])
+        record = json.loads(owner.path.read_text(encoding="utf-8"))["stages"]["catalog_write"]
+        self.assertEqual(record["failure_code"], "RUN_ABANDONED")
+        self.assertIs(record["committed"], True)
+
     def test_failure_codes(self) -> None:
         code = run_journal.failure_code
         self.assertEqual(code(SystemExit("SCHEMA_REQUIRED table is missing"), "X_FAILED"), "SCHEMA_REQUIRED")
@@ -838,6 +985,39 @@ class DatabaseJournalTests(unittest.TestCase):
         self.assertIs(journal["stages"]["validation_write"]["committed"], False)
         self.assertIs(journal["stages"]["catalog_write"]["committed"], True)
         self.assertEqual(self._count("link_checked_at IS NOT NULL"), 0)
+
+    # Phase 0 closure: real commit, then the completion print fails
+    def test_real_commit_then_logging_failure_never_records_uncommitted(self) -> None:
+        real_print = builtins.print
+
+        def broken_print(*args, **kwargs):
+            if args and str(args[0]).startswith("STAGE catalog_write committed"):
+                raise BrokenPipeError(32, "Broken pipe")
+            real_print(*args, **kwargs)
+
+        with patch("jobready_catalog.print", broken_print, create=True):
+            with self.assertRaises(BrokenPipeError):
+                self._run()
+        self.assertEqual(self._count(), 1, "database commit observed")
+        journal = self._journal()
+        write = journal["stages"]["catalog_write"]
+        self.assertEqual(journal["terminal_state"], "failed")
+        self.assertEqual(write["status"], "failed")
+        self.assertIs(write["committed"], True)
+        self.assertEqual(journal["stages"]["validation_select"]["status"], "not_started")
+        self._assert_clean()
+
+    def test_real_commit_failure_is_not_committed(self) -> None:
+        connection = _CommitFailingConnection(catalog.connect(CATALOG_URL))
+        with patch("run_jobready_daily._open_catalog", lambda: connection):
+            with self.assertRaises(SystemExit):
+                self._run()
+        self.assertEqual(connection.commit_attempts, 1)
+        self.assertEqual(self._count(), 0)
+        write = self._journal()["stages"]["catalog_write"]
+        self.assertEqual(write["status"], "failed")
+        self.assertIs(write["committed"], False)
+        self.assertEqual(write["failure_code"], "CATALOG_WRITE_FAILED")
 
     @unittest.skipUnless(APP_URL, "JOBREADY_DAILY_APP_URL is not set")
     def test_real_membership_refusal(self) -> None:

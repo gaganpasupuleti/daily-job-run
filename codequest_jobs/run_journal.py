@@ -53,7 +53,21 @@ _SECRET_ENV_NAMES = (
     "INDEED_API_KEY",
 )
 _SECRET_ENV_PATTERN = re.compile(r"(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|APIKEY|DATABASE_URL|DSN|CREDENTIAL)", re.I)
+_SECRET_KEY = (
+    r"(?<![A-Za-z0-9])(?P<key>api[_-]?key|apikey|access[_-]?key|access[_-]?token|auth[_-]?token"
+    r"|token|secret|password|passwd|pwd|authorization)(?![A-Za-z0-9])"
+)
+# A quoted value may contain spaces and escaped quotes, or be wrapped in escaped quotes.
+_QUOTED_VALUE = r"""(?:\\"(?:(?!\\").)*\\"|\\'(?:(?!\\').)*\\'|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
+_BARE_VALUE = r"(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+"
 _REDACTIONS = (
+    # JSON and dict-repr forms: "key": "value", 'key': 'value', "key": 123, \"key\": \"value\"
+    (
+        re.compile(_SECRET_KEY + r"(?P<quote>\\?[\"'])\s*[:=]\s*(?:" + _QUOTED_VALUE + "|" + _BARE_VALUE + ")", re.I),
+        r"\g<key>\g<quote>: " + REDACTED,
+    ),
+    # key="value with spaces" and key: 'value'
+    (re.compile(_SECRET_KEY + r"\s*[:=]\s*" + _QUOTED_VALUE, re.I), r"\g<key>: " + REDACTED),
     (re.compile(r"postgres(?:ql)?(?:\+\w+)?://\S+", re.I), "[redacted-dsn]"),
     (re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@'\"]*:[^\s/@'\"]*@\S*", re.I), "[redacted-url]"),
     (re.compile(r"\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?\S+", re.I), "authorization=" + REDACTED),
@@ -301,9 +315,20 @@ class RunJournal:
         record["elapsed_sec"] = round(time.perf_counter() - started, 3) if started is not None else 0.0
         return record
 
+    @staticmethod
+    def _set_committed(record: dict[str, Any], committed: bool | None) -> None:
+        """A durable commit, once recorded, is never downgraded."""
+        if record["committed"] is not True:
+            record["committed"] = committed
+
+    def mark_committed(self, stage: str) -> None:
+        """Persist that the stage's database commit succeeded, before any post-commit work."""
+        self.data["stages"][stage]["committed"] = True
+        self.write()
+
     def complete(self, stage: str, *, committed: bool | None = None, **counters: Any) -> None:
         record = self._close(stage, "completed")
-        record["committed"] = committed
+        self._set_committed(record, committed)
         record["counters"].update(counters)
         self.write()
 
@@ -324,7 +349,7 @@ class RunJournal:
         counters: dict[str, Any] | None = None,
     ) -> None:
         record = self._close(stage, "failed")
-        record["committed"] = committed
+        self._set_committed(record, committed)
         record["failure_code"] = code or failure_code(exc, f"{stage.upper()}_FAILED")
         record["failure_message"] = failure_message(exc)
         if counters:
@@ -387,7 +412,8 @@ class RunJournal:
         holds it, so the earlier process ended without finishing. A running
         journal without lock_acquired_at may be a live contender that has not
         reached the lock yet; it is left untouched. A stage that was running is
-        marked failed with committed=null: whether it committed is unknown.
+        marked failed with committed=null (whether it committed is unknown),
+        unless it had already recorded committed=true.
         """
         if not self.data["lock_acquired_at"]:
             raise RuntimeError("mark_abandoned_previous requires lock_acquired_at on this run")
@@ -414,7 +440,7 @@ class RunJournal:
                     record.update(
                         status="failed",
                         finished_at=None,
-                        committed=None,
+                        committed=True if record.get("committed") is True else None,
                         failure_code="RUN_ABANDONED",
                         failure_message="process ended while this stage was running",
                     )

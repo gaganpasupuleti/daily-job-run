@@ -215,9 +215,16 @@ def run_daily(
     started = datetime.now(timezone.utc)
     journal.begin("catalog_plan")
 
+    write_committed = False
+
     def _plan_complete() -> None:
         journal.complete("catalog_plan", rows=len(prepared))
         journal.begin("catalog_write")
+
+    def _write_committed() -> None:
+        nonlocal write_committed
+        write_committed = True
+        journal.mark_committed("catalog_write")
 
     try:
         problems = schema_problems(catalog_conn)
@@ -231,10 +238,15 @@ def run_daily(
             family = row.get("role_family") or "unspecified"
             families[family] = families.get(family, 0) + 1
             sources[row["source"]] = sources.get(row["source"], 0) + 1
-        upserted = upsert_jobs(catalog_conn, prepared, on_plan_complete=_plan_complete)
+        upserted = upsert_jobs(
+            catalog_conn,
+            prepared,
+            on_plan_complete=_plan_complete,
+            on_commit=_write_committed,
+        )
     except BaseException as exc:
         failing = journal.running_stage() or "catalog_plan"
-        journal.fail(failing, exc, committed=False if failing == "catalog_write" else None)
+        journal.fail(failing, exc, committed=write_committed if failing == "catalog_write" else None)
         raise
     if journal.status("catalog_plan") == "running":
         journal.complete("catalog_plan", rows=len(prepared))
