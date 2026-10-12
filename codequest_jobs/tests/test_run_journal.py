@@ -687,7 +687,7 @@ class MockedRunTests(unittest.TestCase):
                 self.assertNotIn(fragment, text)
         journal = _only_journal(self.runs)[1]
         for message in (journal["stages"]["validation_write"]["failure_message"], journal["failure_message"]):
-            self.assertIn("[redacted]", message)
+            self.assertIn("[redacted", message)
             for fragment in fragments:
                 self.assertNotIn(fragment, message)
         return journal
@@ -780,6 +780,53 @@ class MockedRunTests(unittest.TestCase):
         journal = self.run_failing("validation_write", SystemExit("CATALOG_WRITE_FAILED stage=catalog_write lock_timeout"))
         self.assertEqual(journal["failure_code"], "CATALOG_WRITE_FAILED")
         self.assertEqual(journal["failure_message"], "CATALOG_WRITE_FAILED stage=catalog_write lock_timeout")
+        for path in self.runs.glob("*.json"):
+            path.unlink()
+        journal = self.run_failing("validation_write", RuntimeError("token_count=5 tokens_seen=3 password_policy=strict"))
+        expected = "RuntimeError: token_count=5 tokens_seen=3 password_policy=strict"
+        self.assertEqual(journal["stages"]["validation_write"]["failure_message"], expected)
+        self.assertEqual(journal["failure_message"], expected)
+
+    # Phase 0 final re-audit: an unquoted assignment with an object or array value
+    def test_unquoted_structured_secret_values_fail_closed_in_journal(self) -> None:
+        cases = {
+            "object": ('secret={"inner": "SYNTHETIC_OBJECT_VALUE"}', ["SYNTHETIC_OBJECT_VALUE"]),
+            "array": (
+                'token=["SYNTHETIC ARRAY ONE", "SYNTHETIC_ARRAY_TWO"]',
+                ["SYNTHETIC ARRAY ONE", "ARRAY ONE", "SYNTHETIC_ARRAY_TWO"],
+            ),
+            "nested_object": ('api_key={"nested":{"secret":"SYNTHETIC_DEEP_VALUE"}}', ["SYNTHETIC_DEEP_VALUE"]),
+            "array_with_object": ('password=["one", {"two":"SYNTHETIC_DEEP_ARRAY"}]', ["SYNTHETIC_DEEP_ARRAY"]),
+            "authorization_object": (
+                'authorization={"scheme":"Bearer","token":"SYNTHETIC_AUTH_OBJECT"}',
+                ["SYNTHETIC_AUTH_OBJECT"],
+            ),
+            "colon_separator": ('token: {"inner": "SYNTHETIC_COLON_OBJECT"}', ["SYNTHETIC_COLON_OBJECT"]),
+            "spaced_separator": ('secret = [ "SYNTHETIC_SPACED_ARRAY" ]', ["SYNTHETIC_SPACED_ARRAY"]),
+            "inside_prose": (
+                'provider rejected client_secret={"value": "SYNTHETIC PROSE OBJECT"} at login',
+                ["SYNTHETIC PROSE OBJECT", "PROSE OBJECT"],
+            ),
+        }
+        for label, (message, fragments) in cases.items():
+            for failure in (RuntimeError(message), SystemExit(message)):
+                with self.subTest(label, kind=type(failure).__name__):
+                    journal = self.assert_journal_hides(failure, fragments)
+                    self.assertEqual(journal["stages"]["validation_write"]["failure_message"], run_journal.REDACTED)
+                    self.assertEqual(journal["failure_message"], run_journal.REDACTED)
+
+    def test_unquoted_scalar_secrets_redacted_in_journal(self) -> None:
+        cases = {
+            "api_key=SYNTHETIC_KEY": "SYNTHETIC_KEY",
+            "token=SYNTHETIC_TOKEN": "SYNTHETIC_TOKEN",
+            "client_secret=SYNTHETIC_SECRET": "SYNTHETIC_SECRET",
+            "password=SYNTHETIC_PASSWORD": "SYNTHETIC_PASSWORD",
+            "provider said token: SYNTHETIC_COLON_TOKEN, retry later": "SYNTHETIC_COLON_TOKEN",
+        }
+        for message, secret in cases.items():
+            for failure in (RuntimeError(message), SystemExit(message)):
+                with self.subTest(message, kind=type(failure).__name__):
+                    self.assert_journal_hides(failure, [secret])
 
 
 class JournalUnitTests(unittest.TestCase):
@@ -986,11 +1033,44 @@ class JournalUnitTests(unittest.TestCase):
             "unicode_escaped_quotes": '{\\u0022api_key\\u0022: \\u0022SYNTHETIC UNICODE\\u0022}',
             "escaped_newline_before_key": json.dumps("line one\napi_key: SYNTHETIC NEWLINE VALUE"),
             "backslash_in_single_quoted_value": "{'password': 'SYNTH\\' SYNTHETIC_SQ_TAIL'}",
-            "underscore_prefixed_assignment": "client_secret=SYNTHETIC_UNDERSCORE",
+            "bare_value_after_escaped_tab": json.dumps("a\ttoken=SYNTHETIC TAB VALUE"),
+            "bare_value_after_unicode_escape": "x\\u0020password: SYNTHETIC UNICODE BARE",
         }
         for label, text in cases.items():
             with self.subTest(label):
                 self.assertEqual(run_journal.sanitize_text(text), run_journal.REDACTED)
+
+    def test_sanitize_fails_closed_on_unquoted_structured_values(self) -> None:
+        cases = [
+            'secret={"inner": "SYNTHETIC_OBJECT_VALUE"}',
+            'token=["SYNTHETIC ARRAY ONE", "SYNTHETIC_ARRAY_TWO"]',
+            'api_key={"nested":{"secret":"SYNTHETIC_DEEP_VALUE"}}',
+            'password=["one", {"two":"SYNTHETIC_DEEP_ARRAY"}]',
+            'authorization={"scheme":"Bearer","token":"SYNTHETIC_AUTH_OBJECT"}',
+            "pwd=['SYNTHETIC_REPR_LIST']",
+            "access_token: {'k': 'SYNTHETIC_REPR_OBJECT'}",
+        ]
+        for text in cases:
+            with self.subTest(text):
+                self.assertEqual(run_journal.sanitize_text(text), run_journal.REDACTED)
+
+    def test_sanitize_redacts_unquoted_scalar_values(self) -> None:
+        cases = {
+            "api_key=SYNTHETIC_KEY": "SYNTHETIC_KEY",
+            "token=SYNTHETIC_TOKEN": "SYNTHETIC_TOKEN",
+            "client_secret=SYNTHETIC_SECRET": "SYNTHETIC_SECRET",
+            "client_secret=SYNTHETIC_UNDERSCORE": "SYNTHETIC_UNDERSCORE",
+            "password=SYNTHETIC_PASSWORD": "SYNTHETIC_PASSWORD",
+            "x token=SYNTH,TAIL&next=1": "SYNTH,TAIL",
+            "Authorization: Bearer SYNTHETIC_BEARER end": "SYNTHETIC_BEARER",
+        }
+        for text, secret in cases.items():
+            with self.subTest(text):
+                cleaned = run_journal.sanitize_text(text)
+                self.assertNotIn(secret, cleaned)
+                self.assertIn("redacted", cleaned)
+                for token in FORBIDDEN:
+                    self.assertNotIn(token, cleaned.lower())
 
     def test_sanitize_never_raises(self) -> None:
         with patch("run_journal._secret_values", side_effect=RuntimeError("boom")):

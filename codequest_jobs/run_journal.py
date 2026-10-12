@@ -163,23 +163,26 @@ def _bare_value_end(text: str, start: int) -> int | None:
     return None if "\\" in text[start:end] else end
 
 
-def _redact_assignments(text: str) -> str | None:
-    """Replace every quoted secret value; None when any value cannot be bounded.
+def _follows_escape(text: str, start: int) -> bool:
+    """True when the key matched only because an escape such as \\n or \\u0022 precedes it.
 
-    Unquoted key=value text is left to _REDACTIONS.
+    The key then sits inside an encoded string, where whitespace does not bound a bare value.
     """
+    return start > 0 and text[start - 1].isalnum()
+
+
+def _redact_assignments(text: str) -> str | None:
+    """Replace every sensitive assignment's value; None when any value cannot be bounded."""
     parts: list[str] = []
     pos = 0
     while (match := _ASSIGNMENT.search(text, pos)) is not None:
         quote = match.group("vq")
-        if quote is None and match.group("kq") is None:
-            parts.append(text[pos : match.end()])
-            pos = match.end()
-            continue
         if quote is not None:
             end = _quoted_value_end(text, match.end(), quote, len(match.group("esc")))
+        elif match.group("esc") or _follows_escape(text, match.start()):
+            end = None
         else:
-            end = None if match.group("esc") else _bare_value_end(text, match.end())
+            end = _bare_value_end(text, match.end())
         if end is None:
             return None
         parts.append(text[pos : match.start("esc")] + REDACTED)
