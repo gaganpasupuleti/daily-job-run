@@ -332,6 +332,99 @@ class TopCardScopeTests(unittest.TestCase):
         self.assertEqual(linkedin(linkedin_page(after=copy)), ("confirmed_active", "linkedin_identity_apply"))
 
 
+UNCLOSED_APPLY_BUTTON = APPLY_BUTTON.removesuffix("</button>")
+UNCLOSED_APPLY_LINK = '<a class="apply-button apply-button--link" href="https://careers.example.test/apply"> Apply '
+
+
+class InheritedDisabledApplyTests(unittest.TestCase):
+    """Phase 0 closure: disabled state is inherited from a disabled ancestor."""
+
+    def test_button_inside_disabled_fieldset_is_not_open(self) -> None:
+        page = linkedin_page(apply=f"<fieldset disabled>{APPLY_BUTTON}</fieldset>")
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_nested_descendants_of_disabled_fieldset_are_not_open(self) -> None:
+        page = linkedin_page(apply=f"<fieldset disabled><div><span>{APPLY_BUTTON}</span></div></fieldset>")
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_disabled"))
+        nested = f'<fieldset disabled=""><fieldset><div>{APPLY_BUTTON}</div></fieldset></fieldset>'
+        self.assertEqual(linkedin(linkedin_page(apply=nested)), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_link_inside_disabled_fieldset_is_not_open(self) -> None:
+        anchor = '<a class="apply-button apply-button--link" href="https://careers.example.test/apply"> Apply </a>'
+        page = linkedin_page(apply=f"<fieldset disabled>{anchor}</fieldset>")
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_aria_disabled_ancestor_is_not_open(self) -> None:
+        page = linkedin_page(apply=f'<div aria-disabled="true"><span>{APPLY_BUTTON}</span></div>')
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_direct_disabled_and_aria_disabled_remain_disabled(self) -> None:
+        self.assertEqual(linkedin(linkedin_page(apply=DISABLED_APPLY_BUTTON)), ("inconclusive", "linkedin_apply_disabled"))
+        aria = APPLY_BUTTON.replace("<button ", '<button aria-disabled="true" ', 1)
+        self.assertEqual(linkedin(linkedin_page(apply=aria)), ("inconclusive", "linkedin_apply_disabled"))
+
+    def test_enabled_button_after_closed_disabled_fieldset_is_open(self) -> None:
+        apply = f"<fieldset disabled><button> Save </button></fieldset>{APPLY_BUTTON}"
+        self.assertEqual(linkedin(linkedin_page(apply=apply)), ("confirmed_active", "linkedin_identity_apply"))
+
+    def test_disabled_fieldset_elsewhere_does_not_affect_top_card(self) -> None:
+        form = f"<fieldset disabled><div>{APPLY_BUTTON}</div></fieldset>"
+        for place in ("between", "after"):
+            page = linkedin_page(**{place: form})
+            self.assertEqual(linkedin(page), ("confirmed_active", "linkedin_identity_apply"), place)
+        top = "<fieldset disabled><input type='text'></fieldset>"
+        self.assertEqual(linkedin(linkedin_page(top=top)), ("confirmed_active", "linkedin_identity_apply"))
+
+    def test_enabled_fieldset_does_not_disable(self) -> None:
+        page = linkedin_page(apply=f"<fieldset>{APPLY_BUTTON}</fieldset>")
+        self.assertEqual(linkedin(page), ("confirmed_active", "linkedin_identity_apply"))
+
+
+class MalformedApplyTests(unittest.TestCase):
+    """Phase 0 closure: an Apply control counts only if its own end tag closed it."""
+
+    def test_unclosed_apply_button_is_not_open(self) -> None:
+        page = linkedin_page(apply=UNCLOSED_APPLY_BUTTON)
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_malformed"))
+
+    def test_unclosed_apply_link_is_not_open(self) -> None:
+        page = linkedin_page(apply=UNCLOSED_APPLY_LINK)
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_malformed"))
+
+    def test_apply_closed_only_by_outer_top_card_is_not_open(self) -> None:
+        page = (
+            '<section class="top-card-layout container-lined">'
+            '<h2 class="top-card-layout__title">Python Developer</h2>'
+            f'<div class="top-card-layout__cta-container">{UNCLOSED_APPLY_BUTTON}'
+            "</section>"
+            f'<code id="decoratedJobPostingId" style="display: none"><!--"{JOB_ID}"--></code>'
+        )
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_malformed"))
+        stray = APPLY_BUTTON.replace("</button>", "</a>", 1)
+        self.assertEqual(linkedin(linkedin_page(apply=stray)), ("inconclusive", "linkedin_apply_malformed"))
+
+    def test_properly_closed_apply_still_confirms_active(self) -> None:
+        self.assertEqual(linkedin(linkedin_page()), ("confirmed_active", "linkedin_identity_apply"))
+        nested = APPLY_BUTTON.replace(" Apply ", " <span>Apply</span> ", 1)
+        self.assertEqual(linkedin(linkedin_page(apply=nested)), ("confirmed_active", "linkedin_identity_apply"))
+        self_closing_icon = APPLY_BUTTON.replace("></icon>", " />", 1).replace("</icon>", "", 1)
+        self.assertEqual(linkedin(linkedin_page(apply=self_closing_icon)), ("confirmed_active", "linkedin_identity_apply"))
+
+    def test_malformed_hidden_apply_does_not_affect_result(self) -> None:
+        for wrapper in ("<div hidden>", '<div style="display:none">', "<template>"):
+            closing = "</template>" if wrapper == "<template>" else "</div>"
+            page = linkedin_page(apply=f"{wrapper}{UNCLOSED_APPLY_BUTTON}{closing}{APPLY_BUTTON}")
+            self.assertEqual(linkedin(page), ("confirmed_active", "linkedin_identity_apply"), wrapper)
+
+    def test_malformed_apply_beside_valid_apply_is_not_open(self) -> None:
+        page = linkedin_page(apply=f"{APPLY_BUTTON}<div>{UNCLOSED_APPLY_LINK}</div>")
+        self.assertEqual(linkedin(page), ("inconclusive", "linkedin_apply_malformed"))
+
+    def test_unclosed_non_apply_wrapper_does_not_block_valid_apply(self) -> None:
+        page = linkedin_page(apply=f"<p><span>{APPLY_BUTTON}")
+        self.assertEqual(linkedin(page), ("confirmed_active", "linkedin_identity_apply"))
+
+
 class NaukriEvidenceTests(unittest.TestCase):
     def test_explicit_closed_with_matching_id_is_closed(self) -> None:
         payload = {"job": {"jobId": NAUKRI_ID, "title": "Python Developer", "jobStatus": "Expired"}}

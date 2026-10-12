@@ -843,6 +843,7 @@ def upsert_jobs(
     jobs: list[dict[str, Any]],
     *,
     on_plan_complete: Callable[[], None] | None = None,
+    on_commit: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Insert new source identities and refresh jobs seen again.
 
@@ -850,6 +851,8 @@ def upsert_jobs(
     update and insert. A timeout or write error rolls the whole batch back.
     on_plan_complete runs after planning and before the write; if it raises,
     the batch rolls back as a plan failure.
+    on_commit runs as soon as conn.commit() succeeds, before any post-commit
+    logging, so a later failure cannot be mistaken for an uncommitted write.
     A search hit does not change link_status. New rows start active.
     Existing expired rows stay expired until a validator confirms them active.
     scraped_created_at is immutable. synced_at advances only for this scrape.
@@ -890,6 +893,8 @@ def upsert_jobs(
     except Exception as exc:
         conn.rollback()
         raise SystemExit(_write_failure(exc, stage)) from None
+    if on_commit is not None:
+        on_commit()
     counts["catalog_write_sec"] = round(time.perf_counter() - write_started, 3)
     print(
         f"STAGE catalog_write committed elapsed={counts['catalog_write_sec']}",
