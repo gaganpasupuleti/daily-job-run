@@ -40,8 +40,10 @@ from jobready_catalog import (  # noqa: E402
 )
 from jobready_validator import validate_candidates  # noqa: E402
 from normalize import source_job_id  # noqa: E402
+from run_journal import RunJournal  # noqa: E402
 
 OUTPUT_DIR = ROOT / "output"
+RUNS_DIR = OUTPUT_DIR / "runs"
 
 
 def _stamp(moment: datetime) -> str:
@@ -201,46 +203,88 @@ def run_daily(
     validation_limit: int = DEFAULT_VALIDATION_LIMIT,
     full_audit: bool = False,
     probes=None,
+    journal: RunJournal | None = None,
 ) -> dict:
     """Upsert jobs, validate catalog rows, and optionally sync application membership.
 
     validate=True is the canonical daily path. Injected observations are for tests.
-    This function does not create schema.
+    This function does not create schema. Each stage is journaled before it
+    starts and after it ends; failures are recorded and re-raised.
     """
+    journal = journal or RunJournal.disabled()
     started = datetime.now(timezone.utc)
-    problems = schema_problems(catalog_conn)
-    if problems:
-        raise SystemExit("SCHEMA_REQUIRED " + "; ".join(problems))
-    prepared = [prepare_catalog_row(job) for job in jobs]
-    manual_review = sum(1 for row in prepared if row["manual_review_needed"])
-    families: dict[str, int] = {}
-    sources: dict[str, int] = {}
-    for row in prepared:
-        family = row.get("role_family") or "unspecified"
-        families[family] = families.get(family, 0) + 1
-        sources[row["source"]] = sources.get(row["source"], 0) + 1
-    upserted = upsert_jobs(catalog_conn, prepared)
+    journal.begin("catalog_plan")
+
+    def _plan_complete() -> None:
+        journal.complete("catalog_plan", rows=len(prepared))
+        journal.begin("catalog_write")
+
+    try:
+        problems = schema_problems(catalog_conn)
+        if problems:
+            raise SystemExit("SCHEMA_REQUIRED " + "; ".join(problems))
+        prepared = [prepare_catalog_row(job) for job in jobs]
+        manual_review = sum(1 for row in prepared if row["manual_review_needed"])
+        families: dict[str, int] = {}
+        sources: dict[str, int] = {}
+        for row in prepared:
+            family = row.get("role_family") or "unspecified"
+            families[family] = families.get(family, 0) + 1
+            sources[row["source"]] = sources.get(row["source"], 0) + 1
+        upserted = upsert_jobs(catalog_conn, prepared, on_plan_complete=_plan_complete)
+    except BaseException as exc:
+        failing = journal.running_stage() or "catalog_plan"
+        journal.fail(failing, exc, committed=False if failing == "catalog_write" else None)
+        raise
+    if journal.status("catalog_plan") == "running":
+        journal.complete("catalog_plan", rows=len(prepared))
+    if prepared:
+        journal.complete(
+            "catalog_write",
+            committed=True,
+            new=upserted["new"],
+            updated=upserted["updated"],
+            unchanged=upserted["unchanged"],
+            reobserved=upserted["reobserved"],
+        )
+    else:
+        journal.skip("catalog_write", "no_rows")
     validation = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0}
     validation_reasons: dict[str, int] = {}
     validation_started = time.perf_counter()
     if observations is not None:
-        validation = apply_observations(catalog_conn, observations)
+        journal.skip("validation_select", "injected_observations")
+        journal.skip("validation_probe", "injected_observations")
+        with journal.stage("validation_write", committed_on_failure=False) as stage:
+            validation = apply_observations(catalog_conn, observations)
+            stage.committed = True
+            stage.counters.update(validation)
         _stage(f"validation selected={validation['checked']}")
     elif validate:
-        priority = _priority_ids(catalog_conn, upserted)
-        candidates = select_validation_candidates(
-            catalog_conn,
-            limit=validation_limit,
-            full_audit=full_audit,
-            priority_ids=priority,
-        )
-        release_read_transaction(catalog_conn)
+        with journal.stage("validation_select") as stage:
+            priority = _priority_ids(catalog_conn, upserted)
+            candidates = select_validation_candidates(
+                catalog_conn,
+                limit=validation_limit,
+                full_audit=full_audit,
+                priority_ids=priority,
+            )
+            release_read_transaction(catalog_conn)
+            stage.counters.update(priority=len(priority), selected=len(candidates))
         _stage(f"validation selected={len(candidates)}")
-        built = validate_candidates(candidates, probes=probes)
-        validation = apply_observations(catalog_conn, built)
+        with journal.stage("validation_probe") as stage:
+            built = validate_candidates(candidates, probes=probes)
+            stage.counters["observed"] = len(built)
+        with journal.stage("validation_write", committed_on_failure=False) as stage:
+            validation = apply_observations(catalog_conn, built)
+            stage.committed = True
+            stage.counters.update(validation)
         for item in built:
             label = f"{item.observation}:{item.reason}"
             validation_reasons[label] = validation_reasons.get(label, 0) + 1
+    else:
+        for name in ("validation_select", "validation_probe", "validation_write"):
+            journal.skip(name, "validation_not_requested")
     validation_sec = round(time.perf_counter() - validation_started, 3) if observations is not None or validate else 0.0
     if observations is not None or validate:
         _stage(
@@ -249,61 +293,70 @@ def run_daily(
             f"confirmed_expired={validation['confirmed_expired']} "
             f"inconclusive={validation['inconclusive']} elapsed={validation_sec}"
         )
-    totals = catalog_counts(catalog_conn)
     health = source_health or {}
     warning = suspicious_run(len(prepared), source_errors or [], sources_attempted or [], health)
     successful = sorted(name for name, row in health.items() if row.get("succeeded"))
     failed = sorted(name for name, row in health.items() if row.get("failed"))
     membership = None
-    if app_conn is not None:
-        membership = membership_would_change(catalog_conn, app_conn)
-        print(
-            f"would_archive={membership['would_archive']} would_reactivate={membership['would_reactivate']}",
-            flush=True,
-        )
-        if apply_membership:
-            if warning:
-                raise SystemExit(f"membership sync refused: {warning}")
-            from sync_job_ready_ui import archive_ui_jobs_not_in_catalog
+    if app_conn is None:
+        journal.skip("application_sync", "not_requested")
+    else:
+        with journal.stage("application_sync", committed_on_failure=False if apply_membership else None) as stage:
+            membership = membership_would_change(catalog_conn, app_conn)
+            print(
+                f"would_archive={membership['would_archive']} would_reactivate={membership['would_reactivate']}",
+                flush=True,
+            )
+            stage.counters.update(membership, apply_requested=apply_membership)
+            if apply_membership:
+                if warning:
+                    raise SystemExit(f"membership sync refused: {warning}")
+                from sync_job_ready_ui import archive_ui_jobs_not_in_catalog
 
-            membership = archive_ui_jobs_not_in_catalog(confirm_target=confirm_target)
-    finished = datetime.now(timezone.utc)
-    report = {
-        "started_at": started.isoformat(),
-        "finished_at": finished.isoformat(),
-        "elapsed_sec": round((finished - started).total_seconds(), 3),
-        "sources_attempted": sources_attempted or sorted(health) or sorted(sources),
-        "sources_successful": successful,
-        "sources_failed": failed,
-        "source_health": health,
-        "source_errors": source_errors or [],
-        "jobs_scraped": len(jobs),
-        "unique_after_dedupe": len(prepared),
-        "new_catalog_jobs": upserted["new"],
-        "updated_catalog_jobs": upserted["updated"],
-        "unchanged_catalog_jobs": upserted["unchanged"],
-        "reobserved_jobs": upserted["reobserved"],
-        "validated_checked": validation["checked"],
-        "confirmed_active": validation["confirmed_active"],
-        "confirmed_expired": validation["confirmed_expired"],
-        "unknown_or_inconclusive": validation["inconclusive"],
-        "validation_reasons": dict(sorted(validation_reasons.items())),
-        "per_source_counts": sources,
-        "per_family_counts": families,
-        "manual_review_count": manual_review,
-        "catalog_total": totals["total"],
-        "catalog_active": totals["active"],
-        "catalog_expired": totals["expired"],
-        "application_sync": membership,
-        "warning": warning,
-        "lock_held": hold_lock is not None,
-        "validation_limit": None if full_audit else validation_limit,
-        "full_audit": full_audit,
-        "catalog_plan_sec": upserted.get("catalog_plan_sec", 0.0),
-        "catalog_write_sec": upserted.get("catalog_write_sec", 0.0),
-        "validation_sec": validation_sec,
-    }
-    report["report_path"] = str(write_report(report))
+                membership = archive_ui_jobs_not_in_catalog(confirm_target=confirm_target)
+                stage.committed = True
+                stage.counters.update({key: value for key, value in membership.items() if isinstance(value, int)})
+    with journal.stage("report") as stage:
+        totals = catalog_counts(catalog_conn)
+        finished = datetime.now(timezone.utc)
+        report = {
+            "started_at": started.isoformat(),
+            "finished_at": finished.isoformat(),
+            "elapsed_sec": round((finished - started).total_seconds(), 3),
+            "run_id": journal.run_id if journal.path is not None else None,
+            "sources_attempted": sources_attempted or sorted(health) or sorted(sources),
+            "sources_successful": successful,
+            "sources_failed": failed,
+            "source_health": health,
+            "source_errors": source_errors or [],
+            "jobs_scraped": len(jobs),
+            "unique_after_dedupe": len(prepared),
+            "new_catalog_jobs": upserted["new"],
+            "updated_catalog_jobs": upserted["updated"],
+            "unchanged_catalog_jobs": upserted["unchanged"],
+            "reobserved_jobs": upserted["reobserved"],
+            "validated_checked": validation["checked"],
+            "confirmed_active": validation["confirmed_active"],
+            "confirmed_expired": validation["confirmed_expired"],
+            "unknown_or_inconclusive": validation["inconclusive"],
+            "validation_reasons": dict(sorted(validation_reasons.items())),
+            "per_source_counts": sources,
+            "per_family_counts": families,
+            "manual_review_count": manual_review,
+            "catalog_total": totals["total"],
+            "catalog_active": totals["active"],
+            "catalog_expired": totals["expired"],
+            "application_sync": membership,
+            "warning": warning,
+            "lock_held": hold_lock is not None,
+            "validation_limit": None if full_audit else validation_limit,
+            "full_audit": full_audit,
+            "catalog_plan_sec": upserted.get("catalog_plan_sec", 0.0),
+            "catalog_write_sec": upserted.get("catalog_write_sec", 0.0),
+            "validation_sec": validation_sec,
+        }
+        report["report_path"] = str(write_report(report))
+        stage.counters["report_path"] = report["report_path"]
     _stage(
         f"report new={report['new_catalog_jobs']} updated={report['updated_catalog_jobs']} "
         f"unchanged={report['unchanged_catalog_jobs']}"
@@ -390,35 +443,70 @@ def run_apply_schema() -> int:
         lock.release()
 
 
-def execute_daily(args: argparse.Namespace, *, collect=None, probes=None) -> dict:
-    """Orchestration used by the daily command: scrape, upsert, validate, report."""
+def journal_run_fields(args: argparse.Namespace, *, injected_collector: bool) -> dict:
+    """Run-level journal metadata. Flags and counts only; never targets or credentials."""
+    return {
+        "command": "run_jobready_daily",
+        "effective_mode": "full_audit" if args.full_audit else "daily",
+        "validation_limit": None if args.full_audit else args.validation_limit,
+        "full_audit": bool(args.full_audit),
+        "apply_schema": bool(args.apply_schema),
+        "membership_sync_requested": bool(args.sync_application),
+        "confirm_target_provided": bool(args.confirm_target),
+        "sources": args.sources,
+        "max_pages": args.max_pages,
+        "results_wanted": args.results_wanted,
+        "hours_old": args.hours_old,
+        "injected_collector": injected_collector,
+    }
+
+
+def execute_daily(args: argparse.Namespace, *, collect=None, probes=None, journal_dir: Path | None = None) -> dict:
+    """Orchestration used by the daily command: scrape, upsert, validate, report.
+
+    A run journal is written before any work and updated at each stage. A
+    failure is journaled, then re-raised so the command still fails.
+    """
     if args.preflight or args.apply_schema:
         raise SystemExit("execute_daily does not change schema; use the command flags")
     from run_all_sources import collect_jobs
 
     collector = collect or collect_jobs
+    journal = RunJournal.start(
+        journal_dir if journal_dir is not None else RUNS_DIR,
+        run=journal_run_fields(args, injected_collector=collect is not None),
+    )
+    _stage(f"journal run_id={journal.run_id} path={journal.path}")
     lock = DailyRunLock()
-    try:
-        lock.acquire()
-    except SystemExit:
-        print("another JobReady daily run is active", flush=True)
-        raise
     conn = None
     app_conn = None
     try:
-        conn = _open_catalog()
-        problems = schema_problems(conn)
-        if problems:
-            raise SystemExit("SCHEMA_REQUIRED " + "; ".join(problems))
-        release_read_transaction(conn)
+        with journal.stage("preflight") as stage:
+            try:
+                lock.acquire()
+            except SystemExit:
+                print("another JobReady daily run is active", flush=True)
+                raise
+            stage.counters["abandoned_previous"] = len(journal.mark_abandoned_previous())
+            conn = _open_catalog()
+            problems = schema_problems(conn)
+            if problems:
+                raise SystemExit("SCHEMA_REQUIRED " + "; ".join(problems))
+            release_read_transaction(conn)
         scrape_started = time.perf_counter()
-        scraped = collector(
-            sources=args.sources,
-            max_pages=args.max_pages,
-            results_wanted=args.results_wanted,
-            hours_old=args.hours_old,
-            write_json=collect is None,
-        )
+        with journal.stage("scrape") as stage:
+            scraped = collector(
+                sources=args.sources,
+                max_pages=args.max_pages,
+                results_wanted=args.results_wanted,
+                hours_old=args.hours_old,
+                write_json=collect is None,
+            )
+            stage.counters.update(
+                jobs=len(scraped.jobs),
+                sources_attempted=len(scraped.sources_attempted or []),
+                source_errors=len(scraped.errors or []),
+            )
         _stage(
             f"scrape complete jobs={len(scraped.jobs)} "
             f"elapsed={round(time.perf_counter() - scrape_started, 3)}"
@@ -426,7 +514,11 @@ def execute_daily(args: argparse.Namespace, *, collect=None, probes=None) -> dic
         if args.sync_application:
             from sync_job_ready_ui import _app_url, _connect
 
-            app_conn = _connect(_app_url())
+            try:
+                app_conn = _connect(_app_url())
+            except BaseException as exc:
+                journal.fail("application_sync", exc, committed=False, code="APPLICATION_CONNECT_FAILED")
+                raise
         report = run_daily(
             catalog_conn=conn,
             jobs=scraped.jobs,
@@ -441,7 +533,9 @@ def execute_daily(args: argparse.Namespace, *, collect=None, probes=None) -> dic
             validation_limit=args.validation_limit,
             full_audit=args.full_audit,
             probes=probes,
+            journal=journal,
         )
+        journal.finish_completed(report_path=report["report_path"])
         print(
             json.dumps(
                 {
@@ -449,11 +543,19 @@ def execute_daily(args: argparse.Namespace, *, collect=None, probes=None) -> dic
                     "validated_checked": report["validated_checked"],
                     "catalog_active": report["catalog_active"],
                     "report_path": report["report_path"],
+                    "run_journal": str(journal.path),
                 }
             ),
             flush=True,
         )
         return report
+    except BaseException as exc:
+        try:
+            journal.finish_failed(exc)
+        except Exception:
+            print("JOURNAL_WRITE_FAILED", flush=True)
+        print(f"run_journal {journal.path} terminal_state={journal.data['terminal_state']}", flush=True)
+        raise
     finally:
         if app_conn is not None:
             app_conn.close()

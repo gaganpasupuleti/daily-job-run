@@ -11,7 +11,7 @@ import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 import psycopg2
 from psycopg2.extras import Json, execute_values
@@ -838,11 +838,18 @@ def _write_failure(exc: BaseException, stage: str) -> str:
     return f"CATALOG_WRITE_FAILED stage={stage} {reason}"
 
 
-def upsert_jobs(conn, jobs: list[dict[str, Any]]) -> dict[str, Any]:
+def upsert_jobs(
+    conn,
+    jobs: list[dict[str, Any]],
+    *,
+    on_plan_complete: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Insert new source identities and refresh jobs seen again.
 
     The batch is one transaction: prefetch, one CQJ block, then set-based
     update and insert. A timeout or write error rolls the whole batch back.
+    on_plan_complete runs after planning and before the write; if it raises,
+    the batch rolls back as a plan failure.
     A search hit does not change link_status. New rows start active.
     Existing expired rows stay expired until a validator confirms them active.
     scraped_created_at is immutable. synced_at advances only for this scrape.
@@ -869,6 +876,8 @@ def upsert_jobs(conn, jobs: list[dict[str, Any]]) -> dict[str, Any]:
                 f"elapsed={counts['catalog_plan_sec']}",
                 flush=True,
             )
+            if on_plan_complete is not None:
+                on_plan_complete()
             stage = "catalog_write"
             write_started = time.perf_counter()
             print(
