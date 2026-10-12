@@ -3,7 +3,8 @@
 One JSON file per attempted run under codequest_jobs/output/runs/. The file is
 created before any meaningful work and rewritten atomically at every stage
 transition. It holds sanitized metadata only: no DSNs, passwords, tokens, or
-raw exception dumps. The daily report stays the business summary; this file
+raw exception dumps. Text whose secret values cannot be fully redacted is
+stored as [redacted]. The daily report stays the business summary; this file
 records what was attempted, what committed, and where a run stopped.
 """
 
@@ -53,21 +54,23 @@ _SECRET_ENV_NAMES = (
     "INDEED_API_KEY",
 )
 _SECRET_ENV_PATTERN = re.compile(r"(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|APIKEY|DATABASE_URL|DSN|CREDENTIAL)", re.I)
+# A sensitive field name, also when it follows an escape such as \n or \u0022.
+# tokens_seen, token_count, and password_policy are different fields.
 _SECRET_KEY = (
-    r"(?<![A-Za-z0-9])(?P<key>api[_-]?key|apikey|access[_-]?key|access[_-]?token|auth[_-]?token"
-    r"|token|secret|password|passwd|pwd|authorization)(?![A-Za-z0-9])"
+    r"(?:(?<![A-Za-z0-9])|(?<=\\[nrtbf])|(?<=\\u[0-9a-fA-F]{4}))"
+    r"(?P<key>api[_-]?key|apikey|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret"
+    r"|token|secret|password|passwd|pwd|authorization)(?![A-Za-z0-9_-])"
 )
-# A quoted value may contain spaces and escaped quotes, or be wrapped in escaped quotes.
-_QUOTED_VALUE = r"""(?:\\"(?:(?!\\").)*\\"|\\'(?:(?!\\').)*\\'|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
-_BARE_VALUE = r"(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+"
+# key, optionally quoted at any escape depth, then the separator and the value's opening quote run.
+_ASSIGNMENT = re.compile(_SECRET_KEY + r"(?P<kq>\\*[\"'])?\s*[:=]\s*(?P<esc>\\*)(?P<vq>[\"'])?", re.I)
+# Any sensitive assignment, including forms _ASSIGNMENT does not parse; used as a postcondition.
+_ASSIGNMENT_EVIDENCE = re.compile(_SECRET_KEY + r"(?:\\*[\"']|\\u[0-9a-fA-F]{4})?\s*[:=]", re.I)
+_VALUE_FILLER = re.compile(r"[\s\"'\\]*")
+_BARE_SCHEME = re.compile(r"(?:bearer|basic|token)\s+", re.I)
+_BARE_END = re.compile(r"[\s,;&)}\]]")
+# Values nested in more than this many string encodings are not parsed; the message is redacted.
+MAX_ESCAPE_DEPTH = 8
 _REDACTIONS = (
-    # JSON and dict-repr forms: "key": "value", 'key': 'value', "key": 123, \"key\": \"value\"
-    (
-        re.compile(_SECRET_KEY + r"(?P<quote>\\?[\"'])\s*[:=]\s*(?:" + _QUOTED_VALUE + "|" + _BARE_VALUE + ")", re.I),
-        r"\g<key>\g<quote>: " + REDACTED,
-    ),
-    # key="value with spaces" and key: 'value'
-    (re.compile(_SECRET_KEY + r"\s*[:=]\s*" + _QUOTED_VALUE, re.I), r"\g<key>: " + REDACTED),
     (re.compile(r"postgres(?:ql)?(?:\+\w+)?://\S+", re.I), "[redacted-dsn]"),
     (re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@'\"]*:[^\s/@'\"]*@\S*", re.I), "[redacted-url]"),
     (re.compile(r"\bauthorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?\S+", re.I), "authorization=" + REDACTED),
@@ -116,8 +119,86 @@ def _secret_values() -> list[str]:
     return sorted(values, key=len, reverse=True)
 
 
-def sanitize_text(value: Any, limit: int = STRING_LIMIT) -> str:
-    text = str(value)
+def _quoted_value_end(text: str, start: int, quote: str, run: int) -> int | None:
+    """Index just past the quote that closes a value, or None when the end is uncertain.
+
+    A double-quoted value opened after `run` backslashes sits inside up to
+    MAX_ESCAPE_DEPTH JSON string encodings, so run must be 2**depth - 1. Every
+    encoding layer (JSON or repr) keeps backslash runs strictly ordered, so quotes
+    inside the value carry more backslashes than its opening quote. The value closes
+    at the first quote preceded by exactly `run` backslashes; a quote preceded by
+    fewer means the structure is broken. A single-quoted value (Python repr) is
+    accepted only unescaped and without any backslash inside.
+    """
+    if quote == "'":
+        close = text.find("'", start)
+        if run or close < 0 or "\\" in text[start:close]:
+            return None
+        return close + 1
+    if run + 1 > 2**MAX_ESCAPE_DEPTH or run & (run + 1):
+        return None
+    index = text.find('"', start)
+    while index >= 0:
+        back = index
+        while back > start and text[back - 1] == "\\":
+            back -= 1
+        if index - back == run:
+            return index + 1
+        if index - back < run:
+            return None
+        index = text.find('"', index + 1)
+    return None
+
+
+def _bare_value_end(text: str, start: int) -> int | None:
+    """End of an unquoted value, or None when it is structured or escaped."""
+    if text.startswith("[redacted", start):
+        close = text.find("]", start)
+        return close + 1 if close >= 0 else None
+    if text.startswith(("{", "["), start):
+        return None
+    scheme = _BARE_SCHEME.match(text, start)
+    stop = _BARE_END.search(text, scheme.end() if scheme else start)
+    end = stop.start() if stop else len(text)
+    return None if "\\" in text[start:end] else end
+
+
+def _redact_assignments(text: str) -> str | None:
+    """Replace every quoted secret value; None when any value cannot be bounded.
+
+    Unquoted key=value text is left to _REDACTIONS.
+    """
+    parts: list[str] = []
+    pos = 0
+    while (match := _ASSIGNMENT.search(text, pos)) is not None:
+        quote = match.group("vq")
+        if quote is None and match.group("kq") is None:
+            parts.append(text[pos : match.end()])
+            pos = match.end()
+            continue
+        if quote is not None:
+            end = _quoted_value_end(text, match.end(), quote, len(match.group("esc")))
+        else:
+            end = None if match.group("esc") else _bare_value_end(text, match.end())
+        if end is None:
+            return None
+        parts.append(text[pos : match.start("esc")] + REDACTED)
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _has_unredacted_assignment(text: str) -> bool:
+    for match in _ASSIGNMENT_EVIDENCE.finditer(text):
+        if not text.startswith("[redacted", _VALUE_FILLER.match(text, match.end()).end()):
+            return True
+    return False
+
+
+def _sanitize_text(value: Any, limit: int) -> str:
+    text = _redact_assignments(str(value))
+    if text is None:
+        return REDACTED
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     for secret in _secret_values():
@@ -125,9 +206,20 @@ def sanitize_text(value: Any, limit: int = STRING_LIMIT) -> str:
     lowered = text.lower()
     if any(token in lowered for token in _FORBIDDEN):
         return REDACTED
+    if _has_unredacted_assignment(text):
+        return REDACTED
     if len(text) > limit:
         text = text[: limit - 3] + "..."
     return text
+
+
+def sanitize_text(value: Any, limit: int = STRING_LIMIT) -> str:
+    """Redact secrets. Fails closed: the whole text becomes [redacted] when a
+    sensitive field's value cannot be completely redacted, and sanitizing never raises."""
+    try:
+        return _sanitize_text(value, limit)
+    except Exception:
+        return REDACTED
 
 
 def sanitize(value: Any) -> Any:
@@ -145,7 +237,7 @@ def failure_code(exc: BaseException, default: str) -> str:
     if isinstance(exc, SystemExit):
         if isinstance(exc.code, int) or exc.code is None:
             return f"EXIT_{exc.code or 0}"
-        text = str(exc.code).strip()
+        text = (_safe_str(exc.code) or "").strip()
         first = text.split(" ", 1)[0] if text else ""
         if _CODE_TOKEN.match(first):
             return first
@@ -159,11 +251,20 @@ def failure_code(exc: BaseException, default: str) -> str:
     return default
 
 
+def _safe_str(value: Any) -> str | None:
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
 def failure_message(exc: BaseException) -> str:
     if isinstance(exc, SystemExit):
-        text = "" if exc.code is None else str(exc.code)
+        text = "" if exc.code is None else _safe_str(exc.code)
+        text = REDACTED if text is None else text
     else:
-        detail = str(exc)
+        detail = _safe_str(exc)
+        detail = REDACTED if detail is None else detail
         text = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
     return sanitize_text(text, MESSAGE_LIMIT)
 

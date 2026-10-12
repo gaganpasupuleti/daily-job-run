@@ -673,6 +673,114 @@ class MockedRunTests(unittest.TestCase):
                 self.assertIn("redacted", journal["stages"]["validation_write"]["failure_message"])
                 self.assertIn("redacted", journal["failure_message"])
 
+    def assert_journal_hides(self, failure: BaseException, fragments: list[str]) -> dict:
+        """Run the real failure path and check every journal written to disk."""
+        for path in self.runs.glob("*.json"):
+            path.unlink()
+        self.writes.clear()
+        self.run_failing("validation_write", failure)
+        texts = [path.read_text(encoding="utf-8") for path in self.runs.glob("*.json")] + self.writes
+        self.assertTrue(texts)
+        for text in texts:
+            json.loads(text)
+            for fragment in fragments:
+                self.assertNotIn(fragment, text)
+        journal = _only_journal(self.runs)[1]
+        for message in (journal["stages"]["validation_write"]["failure_message"], journal["failure_message"]):
+            self.assertIn("[redacted]", message)
+            for fragment in fragments:
+                self.assertNotIn(fragment, message)
+        return journal
+
+    # Phase 0 re-audit: a double-encoded quoted value must not leak its inner fragment
+    def test_double_encoded_secret_with_escaped_quotes_never_reaches_journal(self) -> None:
+        message = json.dumps(json.dumps({"api_key": 'prefix "SYNTHETIC_INNER_SECRET" suffix'}))
+        for failure in (RuntimeError(message), SystemExit(message)):
+            with self.subTest(type(failure).__name__):
+                self.assert_journal_hides(failure, ["SYNTHETIC_INNER_SECRET", "prefix", "suffix"])
+
+    def test_escaped_and_nested_secret_encodings_never_reach_journal(self) -> None:
+        def enc(value, times: int = 1) -> str:
+            for _ in range(times):
+                value = json.dumps(value)
+            return value
+
+        cases = {
+            "triple_encoded": (
+                enc({"token": 'SYNTH_BEFORE "SYNTHETIC_TRIPLE_SECRET" SYNTH_AFTER'}, 3),
+                ["SYNTHETIC_TRIPLE_SECRET", "SYNTH_BEFORE", "SYNTH_AFTER"],
+            ),
+            "object_encoded_as_string": (
+                json.dumps({"error": json.dumps({"access_token": "SYNTHETIC_NESTED_TOKEN"}, separators=(",", ":"))}),
+                ["SYNTHETIC_NESTED_TOKEN"],
+            ),
+            "escaped_quote_inside_secret": (
+                enc({"password": 'SYNTH_PRE "SYNTHETIC_PASSWORD" SYNTH_POST'}),
+                ["SYNTHETIC_PASSWORD", "SYNTH_PRE", "SYNTH_POST"],
+            ),
+            "backslashes_and_quotes": (
+                r'{"api_key": "SYNTH_PRE\\path\\\"SYNTHETIC_PATH_SECRET\\\"SYNTH_POST"}',
+                ["SYNTHETIC_PATH_SECRET", "SYNTH_PRE", "SYNTH_POST"],
+            ),
+            "backslashes_and_quotes_encoded": (
+                enc({"api_key": 'SYNTH_PRE\\path\\"SYNTHETIC_PATH_SECRET\\"SYNTH_POST'}, 2),
+                ["SYNTHETIC_PATH_SECRET", "SYNTH_PRE", "SYNTH_POST"],
+            ),
+            "authorization": (
+                enc({"authorization": "Bearer SYNTHETIC AUTH VALUE"}),
+                ["SYNTHETIC AUTH VALUE", "AUTH VALUE", "SYNTHETIC"],
+            ),
+            "authorization_encoded": (
+                enc({"Authorization": "Bearer SYNTHETIC AUTH VALUE"}, 2),
+                ["SYNTHETIC AUTH VALUE", "AUTH VALUE", "SYNTHETIC"],
+            ),
+            "python_dict_repr": (str({"client_secret": "SYNTHETIC_CLIENT_SECRET"}), ["SYNTHETIC_CLIENT_SECRET"]),
+            "python_repr_mixed_quotes": (
+                str({"api_key": "it's \"SYNTHETIC_REPR_MIXED\" SYNTH_TAIL"}),
+                ["SYNTHETIC_REPR_MIXED", "SYNTH_TAIL"],
+            ),
+            "python_repr_inside_json": (
+                enc(str({"pwd": 'SYNTH_PRE "SYNTHETIC_REPR_IN_JSON" SYNTH_POST'})),
+                ["SYNTHETIC_REPR_IN_JSON", "SYNTH_PRE", "SYNTH_POST"],
+            ),
+            "mixed_casing": (enc({"API_KEY": "SYNTHETIC_UPPER_SECRET"}), ["SYNTHETIC_UPPER_SECRET"]),
+            "multiple_fields": (
+                enc(
+                    {
+                        "api_key": 'SYNTH_A "SYNTHETIC_MULTI_ONE" SYNTH_B',
+                        "password": "SYNTHETIC_MULTI_TWO",
+                        "auth-token": "SYNTHETIC MULTI THREE",
+                        "access-key": "SYNTHETIC_MULTI_FOUR",
+                    },
+                    2,
+                ),
+                ["SYNTHETIC_MULTI_ONE", "SYNTH_A", "SYNTH_B", "SYNTHETIC_MULTI_TWO", "MULTI THREE", "SYNTHETIC_MULTI_FOUR"],
+            ),
+            "deeply_nested": (
+                enc({"a": {"b": {"c": {"d": {"secret": 'SYNTH_X "SYNTHETIC_DEEP_SECRET" SYNTH_Y'}}}}}, 2),
+                ["SYNTHETIC_DEEP_SECRET", "SYNTH_X", "SYNTH_Y"],
+            ),
+            "deeply_nested_repr": (
+                str({"a": {"b": {"c": {"auth_token": "SYNTHETIC_DEEP_REPR"}}}}),
+                ["SYNTHETIC_DEEP_REPR"],
+            ),
+        }
+        for label, (message, fragments) in cases.items():
+            for failure in (RuntimeError(message), SystemExit(message)):
+                with self.subTest(label, kind=type(failure).__name__):
+                    self.assert_journal_hides(failure, fragments)
+
+    def test_safe_structured_failures_stay_readable_in_journal(self) -> None:
+        control = json.dumps({"stage": "validation_write", "tokens_seen": 3, "token_count": 5, "password_policy": "strict"})
+        journal = self.run_failing("validation_write", RuntimeError(control))
+        self.assertEqual(journal["stages"]["validation_write"]["failure_message"], f"RuntimeError: {control}")
+        self.assertEqual(journal["failure_message"], f"RuntimeError: {control}")
+        for path in self.runs.glob("*.json"):
+            path.unlink()
+        journal = self.run_failing("validation_write", SystemExit("CATALOG_WRITE_FAILED stage=catalog_write lock_timeout"))
+        self.assertEqual(journal["failure_code"], "CATALOG_WRITE_FAILED")
+        self.assertEqual(journal["failure_message"], "CATALOG_WRITE_FAILED stage=catalog_write lock_timeout")
+
 
 class JournalUnitTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -845,6 +953,54 @@ class JournalUnitTests(unittest.TestCase):
     def test_sanitize_keeps_non_secret_keys(self) -> None:
         text = "{'stage': 'catalog_write', 'tokens_seen': 3, 'reason': 'lock_timeout'}"
         self.assertEqual(run_journal.sanitize_text(text), text)
+
+    def test_sanitize_keeps_safe_controls_readable(self) -> None:
+        control = {"stage": "validation_write", "tokens_seen": 3, "token_count": 5, "password_policy": "strict"}
+        cases = [
+            json.dumps(control),
+            json.dumps(json.dumps(control)),
+            str(control),
+            "CATALOG_WRITE_FAILED stage=catalog_write lock_timeout",
+            'password authentication failed for user "jobready"',
+            "C:\\Users\\runner\\output\\runs\\report.json not found",
+            "token_count=5 tokens_seen=3 password_policy=strict",
+        ]
+        for text in cases:
+            with self.subTest(text):
+                self.assertEqual(run_journal.sanitize_text(text), text)
+
+    def test_sanitize_fails_closed_when_a_secret_value_cannot_be_bounded(self) -> None:
+        def enc(value, times: int) -> str:
+            for _ in range(times):
+                value = json.dumps(value)
+            return value
+
+        truncated = enc({"api_key": 'prefix "SYNTHETIC_TRUNCATED" suffix'}, 2)
+        cases = {
+            "malformed_escape_run": r'{\\"api_key\\": \\"SYNTHETIC_MALFORMED\\"}',
+            "truncated_encoded_json": truncated[: truncated.index("SYNTHETIC_TRUNCATED") + 25],
+            "unterminated_single_quote": "{'password': 'SYNTHETIC_UNTERMINATED",
+            "unterminated_double_quote": '{"token": "SYNTHETIC UNTERMINATED VALUE',
+            "excessive_escape_depth": enc({"token": "SYNTHETIC_TOO_DEEP"}, 10),
+            "object_valued_secret": '{"secret": {"inner": "SYNTHETIC_OBJECT"}}',
+            "unicode_escaped_quotes": '{\\u0022api_key\\u0022: \\u0022SYNTHETIC UNICODE\\u0022}',
+            "escaped_newline_before_key": json.dumps("line one\napi_key: SYNTHETIC NEWLINE VALUE"),
+            "backslash_in_single_quoted_value": "{'password': 'SYNTH\\' SYNTHETIC_SQ_TAIL'}",
+            "underscore_prefixed_assignment": "client_secret=SYNTHETIC_UNDERSCORE",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertEqual(run_journal.sanitize_text(text), run_journal.REDACTED)
+
+    def test_sanitize_never_raises(self) -> None:
+        with patch("run_journal._secret_values", side_effect=RuntimeError("boom")):
+            self.assertEqual(run_journal.sanitize_text("any text"), run_journal.REDACTED)
+
+        class Unprintable(Exception):
+            def __str__(self) -> str:
+                raise ValueError("cannot render")
+
+        self.assertEqual(run_journal.failure_message(Unprintable()), f"Unprintable: {run_journal.REDACTED}")
 
     def test_committed_true_is_never_downgraded(self) -> None:
         journal = run_journal.RunJournal.start(self.dir, run={}, git_commit=None)
