@@ -9,6 +9,7 @@ failure is inconclusive. A missing Apply action is not closure.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -19,10 +20,14 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from link_policy import CONFIRMED_ACTIVE, CONFIRMED_EXPIRED, INCONCLUSIVE
+from link_policy import (
+    CONFIRMED_ACTIVE,
+    CONFIRMED_EXPIRED,
+    INCONCLUSIVE,
+    sanitize_evidence_url,
+    valid_http_status,
+)
 from linkedin_checker import CLOSED_MARKERS, GUEST_URL, HEADERS, linkedin_job_id_from_url
-
-Probe = Callable[[dict[str, Any]], tuple[str, str, str]]
 
 LINKEDIN_IDENTITY_RE = re.compile(
     r'id="decoratedJobPostingId"[^>]*>\s*<!--\s*"?(\d+)"?\s*-->',
@@ -64,6 +69,26 @@ NAUKRI_OPEN_STATUS = {"active", "open", "live"}
 JOBREADY_EVIDENCE_VERSION = "jobready-validator-v1"
 
 
+# httpx logs every request URL at INFO, query string and userinfo included, and httpcore
+# logs connection detail at DEBUG. Provider redirects can put tokens in those URLs.
+TRANSPORT_LOGGERS = ("httpx", "httpcore")
+
+
+def quiet_transport_logging() -> None:
+    """Keep provider transport loggers at WARNING or above, whatever the process configured.
+
+    Applied at import and again before every provider request, so a later INFO
+    configuration cannot re-enable raw URL logging. Other loggers are untouched.
+    """
+    for name in TRANSPORT_LOGGERS:
+        transport = logging.getLogger(name)
+        if transport.getEffectiveLevel() < logging.WARNING:
+            transport.setLevel(logging.WARNING)
+
+
+quiet_transport_logging()
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -78,6 +103,42 @@ class LinkObservation:
     # When the provider evidence was observed, not when it is written.
     observed_at: datetime = field(default_factory=_utc_now)
     evidence_version: str = JOBREADY_EVIDENCE_VERSION
+    # HTTP provenance: sanitized URLs and the response status, or None when unknown.
+    requested_url: str | None = None
+    final_url: str | None = None
+    http_status: int | None = None
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """One provider probe. URLs are sanitized on construction, so raw response URLs never leave it.
+
+    Provenance is set only for a request that was actually made; otherwise it stays None.
+    """
+
+    observation: str
+    reason: str
+    provider: str
+    requested_url: str | None = None
+    final_url: str | None = None
+    http_status: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "requested_url", sanitize_evidence_url(self.requested_url))
+        object.__setattr__(self, "final_url", sanitize_evidence_url(self.final_url))
+        if self.http_status is not None and not valid_http_status(self.http_status):
+            raise ValueError("http_status must be an integer HTTP status code")
+
+
+Probe = Callable[[dict[str, Any]], "ProbeResult | tuple[str, str, str]"]
+
+
+def probe_result(value: ProbeResult | tuple[str, str, str]) -> ProbeResult:
+    """Legacy probes return (observation, reason, provider) and carry no HTTP provenance."""
+    if isinstance(value, ProbeResult):
+        return value
+    observation, reason, provider = value
+    return ProbeResult(observation, reason, provider)
 
 
 def interpret_indeed(*, expired: Any, key_configured: bool) -> tuple[str, str]:
@@ -391,23 +452,26 @@ def validate_candidates(rows: list[dict[str, Any]], probes: dict[str, Probe] | N
     A probe that raises is recorded as inconclusive for that row only.
     """
     chosen = probes if probes is not None else default_probes()
-    generic = chosen.get("generic", lambda row: (*interpret_generic(row.get("source") or ""), row.get("source") or "unknown"))
+    generic = chosen.get("generic", probe_generic)
     observations: list[LinkObservation] = []
     for row in rows:
         source = (row.get("source") or "").strip().lower()
         probe = chosen.get(source, generic)
         try:
-            observation, reason, provider = probe(row)
+            result = probe_result(probe(row))
         except Exception:
-            observation, reason, provider = INCONCLUSIVE, f"{source or 'unknown'}_probe_error", source or "unknown"
+            result = ProbeResult(INCONCLUSIVE, f"{source or 'unknown'}_probe_error", source or "unknown")
         observations.append(
             LinkObservation(
                 job_id=row["job_id"],
                 previous_status=row.get("link_status") or "active",
-                observation=observation,
-                provider=provider,
-                reason=reason,
+                observation=result.observation,
+                provider=result.provider,
+                reason=result.reason,
                 observed_at=_utc_now(),
+                requested_url=result.requested_url,
+                final_url=result.final_url,
+                http_status=result.http_status,
             )
         )
     return observations
@@ -418,52 +482,73 @@ def default_probes() -> dict[str, Probe]:
         "indeed": probe_indeed,
         "linkedin": probe_linkedin,
         "naukri": probe_naukri,
-        "generic": lambda row: (*interpret_generic(row.get("source") or ""), row.get("source") or "unknown"),
+        "generic": probe_generic,
     }
 
 
-def probe_indeed(row: dict[str, Any]) -> tuple[str, str, str]:
-    from indeed_checker import check_indeed_via_api, indeed_jk_from_url
+def probe_generic(row: dict[str, Any]) -> ProbeResult:
+    """No provider request is made, so there is no HTTP provenance."""
+    source = row.get("source") or ""
+    observation, reason = interpret_generic(source)
+    return ProbeResult(observation, reason, source or "unknown")
 
+
+def probe_indeed(row: dict[str, Any]) -> ProbeResult:
+    from indeed_checker import INDEED_GRAPHQL, check_indeed_via_api, indeed_jk_from_url
+
+    quiet_transport_logging()
     if not (os.getenv("INDEED_API_KEY") or "").strip():
         observation, reason = interpret_indeed(expired=None, key_configured=False)
-        return observation, reason, "indeed"
+        return ProbeResult(observation, reason, "indeed")
     jk = indeed_jk_from_url(row.get("job_url") or "")
     if not jk:
-        return INCONCLUSIVE, "indeed_missing_job_key", "indeed"
+        return ProbeResult(INCONCLUSIVE, "indeed_missing_job_key", "indeed")
     result = check_indeed_via_api(jk)
     expired = True if result == "expired" else False if result == "active" else None
     observation, reason = interpret_indeed(expired=expired, key_configured=True)
-    return observation, reason, "indeed"
+    # The helper does not expose its response, so only the endpoint it posted to is known.
+    return ProbeResult(observation, reason, "indeed", requested_url=INDEED_GRAPHQL)
 
 
-def probe_linkedin(row: dict[str, Any]) -> tuple[str, str, str]:
+def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
+    quiet_transport_logging()
     job_id = linkedin_job_id_from_url(row.get("job_url") or "")
     if not job_id:
-        return INCONCLUSIVE, "linkedin_unrecognized_url", "linkedin"
+        return ProbeResult(INCONCLUSIVE, "linkedin_unrecognized_url", "linkedin")
+    endpoint = GUEST_URL.format(job_id=job_id)
     try:
         with httpx.Client(timeout=8.0, follow_redirects=True, headers=HEADERS) as client:
-            response = client.get(GUEST_URL.format(job_id=job_id))
+            response = client.get(endpoint)
     except httpx.HTTPError:
         observation, reason = interpret_linkedin(
             status_code=None, body=None, expected_job_id=job_id, final_url=None, error="connection"
         )
-        return observation, reason, "linkedin"
+        return ProbeResult(observation, reason, "linkedin", requested_url=endpoint)
+    final_url = str(response.url)
     observation, reason = interpret_linkedin(
         status_code=response.status_code,
         body=response.text,
         expected_job_id=job_id,
-        final_url=str(response.url),
+        final_url=final_url,
     )
-    return observation, reason, "linkedin"
+    return ProbeResult(
+        observation,
+        reason,
+        "linkedin",
+        requested_url=endpoint,
+        final_url=final_url,
+        http_status=response.status_code,
+    )
 
 
-def probe_naukri(row: dict[str, Any]) -> tuple[str, str, str]:
+def probe_naukri(row: dict[str, Any]) -> ProbeResult:
     from link_checker import _naukri_job_id_from_url
 
+    quiet_transport_logging()
     job_id = _naukri_job_id_from_url(row.get("job_url") or "")
     if not job_id:
-        return INCONCLUSIVE, "naukri_unrecognized_url", "naukri"
+        return ProbeResult(INCONCLUSIVE, "naukri_unrecognized_url", "naukri")
+    requested = None
     try:
         import sys
         from pathlib import Path
@@ -473,10 +558,13 @@ def probe_naukri(row: dict[str, Any]) -> tuple[str, str, str]:
             sys.path.append(str(scraper))
         from naukri_api import JOB_DETAIL_URL, NaukriSearchClient, generate_nkparam
 
+        endpoint = JOB_DETAIL_URL.format(job_id=job_id)
         client = NaukriSearchClient(delay_seconds=0.2)
         try:
+            # Set only once the detail request is issued; a failed session warm-up is not one.
+            requested = endpoint
             response = client._client.get(
-                JOB_DETAIL_URL.format(job_id=job_id),
+                endpoint,
                 params={"microsite": "y", "src": "jobsearchDesk", "xp": "1", "px": "1"},
                 headers={
                     "Accept": "application/json",
@@ -492,17 +580,25 @@ def probe_naukri(row: dict[str, Any]) -> tuple[str, str, str]:
         observation, reason = interpret_naukri(
             status_code=None, payload=None, expected_job_id=job_id, final_url=None, error="connection"
         )
-        return observation, reason, "naukri"
+        return ProbeResult(observation, reason, "naukri", requested_url=requested)
     payload = None
     if response.status_code == 200:
         try:
             payload = response.json()
         except Exception:
             payload = None
+    final_url = str(response.url)
     observation, reason = interpret_naukri(
         status_code=response.status_code,
         payload=payload,
         expected_job_id=job_id,
-        final_url=str(response.url),
+        final_url=final_url,
     )
-    return observation, reason, "naukri"
+    return ProbeResult(
+        observation,
+        reason,
+        "naukri",
+        requested_url=requested,
+        final_url=final_url,
+        http_status=response.status_code,
+    )

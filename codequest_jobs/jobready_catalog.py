@@ -17,6 +17,8 @@ from typing import Any, Callable
 import psycopg2
 from psycopg2.extras import Json, execute_values
 
+from link_policy import sanitize_evidence_url, valid_http_status
+
 # Session lock for the whole daily run. Released on disconnect.
 RUN_LOCK_KEY = 87264011
 # Transaction lock around new CQJ allocation.
@@ -1047,6 +1049,9 @@ CREATE TEMP TABLE lifecycle_batch (
     provider TEXT NOT NULL,
     evidence_version TEXT NOT NULL,
     label TEXT NOT NULL,
+    requested_url TEXT,
+    final_url TEXT,
+    http_status INTEGER,
     previous_link_status TEXT,
     resulting_link_status TEXT
 ) ON COMMIT DROP
@@ -1074,11 +1079,13 @@ WHERE v.job_id = b.job_id
 EVIDENCE_LEDGER_SQL = """
 INSERT INTO jobready_link_observations (
     job_id, observed_at, observation, reason, provider,
-    previous_link_status, resulting_link_status, run_id, evidence_version
+    previous_link_status, resulting_link_status, run_id,
+    requested_url, final_url, http_status, evidence_version
 )
 SELECT
     job_id, observed_at, observation, reason, provider,
-    previous_link_status, resulting_link_status, %s, evidence_version
+    previous_link_status, resulting_link_status, %s,
+    requested_url, final_url, http_status, evidence_version
 FROM lifecycle_batch
 ORDER BY ord
 """
@@ -1118,6 +1125,7 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
         provider = INJECTED_PROVIDER
         evidence_version = INJECTED_EVIDENCE_VERSION
         observed_at = datetime.now(timezone.utc)
+        requested_url = final_url = http_status = None
     else:
         job_id = item.job_id
         raw = item.observation
@@ -1125,12 +1133,21 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
         provider = item.provider or "unknown"
         evidence_version = item.evidence_version
         observed_at = item.observed_at
+        requested_url = getattr(item, "requested_url", None)
+        final_url = getattr(item, "final_url", None)
+        http_status = getattr(item, "http_status", None)
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("observation job_id is required")
     if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be a timezone-aware datetime")
     if not isinstance(evidence_version, str) or not evidence_version.strip():
         raise ValueError("evidence_version is required")
+    # Messages never echo the value: an unsanitized URL may carry credentials.
+    for name, url in (("requested_url", requested_url), ("final_url", final_url)):
+        if url is not None and sanitize_evidence_url(url) != url:
+            raise ValueError(f"{name} must be a sanitized http(s) evidence URL")
+    if http_status is not None and not valid_http_status(http_status):
+        raise ValueError("http_status must be an integer HTTP status code")
     label = raw if not reason or reason == raw else f"{raw}:{reason}"
     observation = raw if raw in LIFECYCLE_OBSERVATIONS else "inconclusive"
     return (
@@ -1142,6 +1159,9 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
         str(provider)[:200],
         evidence_version,
         label[:200],
+        requested_url,
+        final_url,
+        http_status,
     )
 
 
@@ -1176,7 +1196,7 @@ def apply_link_observations(
             execute_values(
                 cur,
                 "INSERT INTO lifecycle_batch (ord, job_id, observed_at, observation, reason, provider, "
-                "evidence_version, label) VALUES %s",
+                "evidence_version, label, requested_url, final_url, http_status) VALUES %s",
                 rows,
                 page_size=len(rows),
             )
