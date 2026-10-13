@@ -1,4 +1,4 @@
-"""Phase 1 lifecycle evidence schema: additive, inert, append-only.
+"""Phase 1 lifecycle evidence schema: additive, append-only, required by the daily run.
 
 Database cases use disposable Postgres named by JOBREADY_DAILY_CATALOG_URL.
 They are skipped when that variable is absent.
@@ -30,7 +30,6 @@ import psycopg2.errors  # noqa: E402
 import jobready_catalog as catalog  # noqa: E402
 import run_jobready_daily as daily  # noqa: E402
 from normalize import UnifiedJob  # noqa: E402
-from run_all_sources import ScrapeResult  # noqa: E402
 
 CATALOG_URL = os.environ.get("JOBREADY_DAILY_CATALOG_URL", "").strip()
 
@@ -94,39 +93,6 @@ def _job(url: str, *, source: str = "naukri") -> UnifiedJob:
         apply_url=url,
         job_type="fulltime",
     )
-
-
-def _scrape(urls: list[str]):
-    health = {
-        "naukri": {
-            "attempted": True,
-            "succeeded": True,
-            "failed": False,
-            "jobs_returned": len(urls),
-            "errors": [],
-        }
-    }
-
-    def collect(**_kwargs):
-        return ScrapeResult(
-            jobs=[_job(url) for url in urls],
-            per_source={"naukri": len(urls)},
-            per_family={"python-dev": len(urls)},
-            errors=[],
-            sources_attempted=["naukri"],
-            started_at="2026-10-10T00:00:00+00:00",
-            finished_at="2026-10-10T00:00:01+00:00",
-            source_health=health,
-        )
-
-    return collect
-
-
-def _probe_by_url(results: dict[str, str]):
-    def probe(row):
-        return (results[row["job_url"]], "fixture", row.get("source") or "naukri")
-
-    return probe
 
 
 @unittest.skipUnless(CATALOG_URL, "disposable daily catalog is not configured")
@@ -280,21 +246,6 @@ class LifecycleSchemaTests(unittest.TestCase):
             """,
             (f"public.{TABLE}",),
         )
-
-    def _execute_daily(self, urls: list[str], probe) -> dict:
-        previous = os.environ.get("JOB_READY_DATABASE_URL")
-        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
-        try:
-            args = daily.parse_args(["--sources", "naukri", "--validation-limit", "10"])
-            with redirect_stdout(io.StringIO()):
-                return daily.execute_daily(
-                    args,
-                    collect=_scrape(urls),
-                    probes={"naukri": probe, "generic": probe},
-                    journal_dir=self.base / "runs",
-                )
-        finally:
-            _restore_env("JOB_READY_DATABASE_URL", previous)
 
     def _with_catalog_env(self, function):
         previous = os.environ.get("JOB_READY_DATABASE_URL")
@@ -484,90 +435,63 @@ class LifecycleSchemaTests(unittest.TestCase):
         self.conn.rollback()
         self.assertFalse(self._phase1_present())
 
-    # Inert merge: today's runtime must work on a catalog that has not had --apply-schema.
-    def test_daily_requirements_exclude_phase1_objects(self) -> None:
-        for name in NEW_NAMES:
-            self.assertNotIn(name, catalog.REQUIRED_COLUMNS)
-            self.assertNotIn(name, catalog.REQUIRED_INDEXES)
-
-    def test_preflight_passes_without_phase1_objects(self) -> None:
-        self._deactivate()
+    # P1.2: the runtime writes lifecycle evidence, so the daily run requires the Phase 1 objects.
+    def test_daily_requirements_include_phase1_objects(self) -> None:
+        for name in NEW_COLUMNS:
+            self.assertIn(name, catalog.REQUIRED_COLUMNS)
+        self.assertEqual(catalog.LIFECYCLE_TABLE, TABLE)
+        self.assertEqual(set(catalog.LIFECYCLE_COLUMNS), set(EXPECTED_COLUMNS))
+        self.assertEqual(catalog.LIFECYCLE_INDEXES, NEW_INDEXES)
         self.assertEqual(catalog.schema_problems(self.conn), [])
-        self.conn.rollback()
-        code, output = self._with_catalog_env(daily.run_preflight)
-        self.assertEqual(code, 0)
-        self.assertIn("PREFLIGHT_OK", output)
-        self.assertFalse(self._phase1_present())
 
-    def test_daily_runs_without_phase1_objects(self) -> None:
+    def test_preflight_refuses_without_phase1_objects(self) -> None:
         self._deactivate()
-        urls = ["https://example.test/jobs/inert-open", "https://example.test/jobs/inert-closed"]
-        probe = _probe_by_url({urls[0]: "confirmed_active", urls[1]: "confirmed_expired"})
-        with patch.object(daily, "apply_schema", side_effect=AssertionError("daily applied schema")), patch.object(
-            catalog, "ensure_schema", side_effect=AssertionError("daily ensured schema")
-        ):
-            report = self._execute_daily(urls, probe)
-            job_ids = [row[0] for row in self._fetch("SELECT job_id FROM validated_jobs ORDER BY id")]
-            observed = daily.run_daily(
-                catalog_conn=self.conn,
-                jobs=[],
-                observations=[(job_id, "active", "inconclusive") for job_id in job_ids],
-            )
-        self.assertEqual(report["confirmed_active"], 1)
-        self.assertEqual(report["confirmed_expired"], 1)
-        self.assertEqual(observed["validated_checked"], 2)
-        statuses = dict(self._fetch("SELECT job_url, link_status FROM validated_jobs"))
-        self.assertEqual(statuses, {urls[0]: "active", urls[1]: "expired"})
+        problems = catalog.schema_problems(self.conn)
+        self.conn.rollback()
+        self.assertIn("missing columns: last_confirmed_open_at, last_confirmed_closed_at", problems)
+        self.assertIn(f"{TABLE} table is missing", problems)
+        code, output = self._with_catalog_env(daily.run_preflight)
+        self.assertEqual(code, 1)
+        self.assertIn("PREFLIGHT_FAILED", output)
         self.assertFalse(self._phase1_present())
 
-    # L: with Phase 1 applied, the daily runtime still neither reads nor writes it.
-    def test_daily_does_not_write_lifecycle_evidence(self) -> None:
-        urls = [
-            "https://example.test/jobs/l-open",
-            "https://example.test/jobs/l-closed",
-            "https://example.test/jobs/l-unknown",
-        ]
-        probe = _probe_by_url({urls[0]: "confirmed_active", urls[1]: "confirmed_expired", urls[2]: "inconclusive"})
-        report = self._execute_daily(urls, probe)
-        self.assertEqual(report["confirmed_active"], 1)
-        self.assertEqual(report["confirmed_expired"], 1)
-        self.assertEqual(self._observation_count(), 0)
-        self.assertEqual(self._confirmed(), [(None, None)] * 3)
+    def test_daily_refuses_without_phase1_objects_and_does_not_create_them(self) -> None:
+        self._deactivate()
+        calls: list[str] = []
 
-        ids = dict(self._fetch("SELECT job_url, job_id FROM validated_jobs"))
-        daily.run_daily(
-            catalog_conn=self.conn,
-            jobs=[],
-            observations=[
-                (ids[urls[0]], "active", "confirmed_expired"),
-                (ids[urls[1]], "expired", "confirmed_active"),
-                (ids[urls[2]], "active", "inconclusive"),
-            ],
-        )
-        statuses = dict(self._fetch("SELECT job_url, link_status FROM validated_jobs"))
-        self.assertEqual(statuses, {urls[0]: "expired", urls[1]: "active", urls[2]: "active"})
-        self.assertEqual(self._observation_count(), 0)
-        self.assertEqual(self._confirmed(), [(None, None)] * 3)
+        def collect(**_kwargs):
+            calls.append("scrape")
+            raise AssertionError("scrape ran without the lifecycle schema")
+
+        previous = os.environ.get("JOB_READY_DATABASE_URL")
+        os.environ["JOB_READY_DATABASE_URL"] = CATALOG_URL
+        try:
+            args = daily.parse_args(["--sources", "naukri", "--validation-limit", "10"])
+            with patch.object(daily, "apply_schema", side_effect=AssertionError("daily applied schema")), patch.object(
+                catalog, "ensure_schema", side_effect=AssertionError("daily ensured schema")
+            ), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                daily.execute_daily(args, collect=collect, journal_dir=self.base / "runs")
+        finally:
+            _restore_env("JOB_READY_DATABASE_URL", previous)
+        self.assertIn("SCHEMA_REQUIRED", str(raised.exception))
+        self.assertEqual(calls, [])
+        self.assertFalse(self._phase1_present())
 
 
 class RuntimeReferenceTests(unittest.TestCase):
-    def test_phase1_names_appear_only_in_schema_sql(self) -> None:
+    def test_only_the_catalog_module_touches_phase1_objects(self) -> None:
         sources = [
             path
             for directory in (ROOT, SCRAPER, REPO / "link_validator_service")
             if directory.is_dir()
             for path in directory.rglob("*.py")
-            if "tests" not in path.relative_to(REPO).parts
+            if "tests" not in path.relative_to(REPO).parts and path.name != "jobready_catalog.py"
         ]
         self.assertTrue(sources)
         for path in sources:
             text = path.read_text(encoding="utf-8", errors="replace")
             for name in NEW_NAMES:
-                count = text.count(name)
-                if path.name == "jobready_catalog.py":
-                    self.assertEqual(count, catalog.SCHEMA_SQL.count(name), f"{name} outside SCHEMA_SQL")
-                else:
-                    self.assertEqual(count, 0, f"{name} referenced in {path.relative_to(REPO)}")
+                self.assertNotIn(name, text, f"{name} referenced in {path.relative_to(REPO)}")
 
 
 def _restore_env(name: str, value: str | None) -> None:

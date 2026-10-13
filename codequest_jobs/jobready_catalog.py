@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -168,14 +169,40 @@ REQUIRED_COLUMNS = (
     "link_checked_at",
     "last_link_observation",
     "updated_at",
+    "last_confirmed_open_at",
+    "last_confirmed_closed_at",
 )
 
-# Lifecycle evidence objects are deliberately absent from REQUIRED_COLUMNS and REQUIRED_INDEXES:
-# the daily run neither reads nor writes them, so a catalog without them must still pass.
 REQUIRED_INDEXES = (
     "idx_validated_jobs_source_id_unique",
     "idx_validated_jobs_link_checked_at",
 )
+
+LIFECYCLE_TABLE = "jobready_link_observations"
+LIFECYCLE_COLUMNS = (
+    "id",
+    "job_id",
+    "observed_at",
+    "recorded_at",
+    "observation",
+    "reason",
+    "provider",
+    "previous_link_status",
+    "resulting_link_status",
+    "run_id",
+    "requested_url",
+    "final_url",
+    "http_status",
+    "evidence_version",
+)
+LIFECYCLE_INDEXES = (
+    "idx_jobready_link_observations_job_time",
+    "idx_jobready_link_observations_observed_at",
+)
+LIFECYCLE_OBSERVATIONS = ("confirmed_active", "confirmed_expired", "inconclusive")
+# Tuple observations (job_id, previous_status, observation) carry no provider evidence.
+INJECTED_PROVIDER = "injected"
+INJECTED_EVIDENCE_VERSION = "jobready-injected-v1"
 
 # A normal daily run checks this many catalog rows, oldest first after the priority share.
 DEFAULT_VALIDATION_LIMIT = 200
@@ -308,6 +335,66 @@ def schema_problems(conn) -> list[str]:
         missing_indexes = [name for name in REQUIRED_INDEXES if name not in indexes]
         if missing_indexes:
             problems.append("missing indexes: " + ", ".join(missing_indexes))
+        problems.extend(_lifecycle_problems(cur))
+    return problems
+
+
+def _lifecycle_problems(cur) -> list[str]:
+    """The evidence ledger must exist with its columns, FK, observation CHECK, and indexes."""
+    cur.execute("SELECT to_regclass(%s)", (f"public.{LIFECYCLE_TABLE}",))
+    if cur.fetchone()[0] is None:
+        return [f"{LIFECYCLE_TABLE} table is missing"]
+    problems: list[str] = []
+    cur.execute(
+        """
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %s
+        """,
+        (LIFECYCLE_TABLE,),
+    )
+    present = {row[0] for row in cur.fetchall()}
+    missing = [name for name in LIFECYCLE_COLUMNS if name not in present]
+    if missing:
+        problems.append(f"missing {LIFECYCLE_TABLE} columns: " + ", ".join(missing))
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM pg_constraint c
+        WHERE c.conrelid = %s::regclass
+          AND c.contype = 'f'
+          AND c.confrelid = 'public.validated_jobs'::regclass
+          AND c.confdeltype = 'r'
+          AND c.conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = c.conrelid AND attname = 'job_id')]
+          AND c.confkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = c.confrelid AND attname = 'job_id')]
+        """,
+        (f"public.{LIFECYCLE_TABLE}",),
+    )
+    if not cur.fetchone()[0]:
+        problems.append(f"missing {LIFECYCLE_TABLE} foreign key to validated_jobs(job_id) ON DELETE RESTRICT")
+    cur.execute(
+        """
+        SELECT pg_get_constraintdef(oid) FROM pg_constraint
+        WHERE conrelid = %s::regclass AND contype = 'c'
+        """,
+        (f"public.{LIFECYCLE_TABLE}",),
+    )
+    allowed = set(LIFECYCLE_OBSERVATIONS)
+    if not any(
+        "observation" in definition and set(re.findall(r"'([a-z_]+)'::text", definition)) == allowed
+        for (definition,) in cur.fetchall()
+    ):
+        problems.append(f"missing {LIFECYCLE_TABLE} observation check")
+    cur.execute(
+        """
+        SELECT i.relname FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        WHERE x.indrelid = %s::regclass AND x.indisvalid
+        """,
+        (f"public.{LIFECYCLE_TABLE}",),
+    )
+    indexes = {row[0] for row in cur.fetchall()}
+    missing_indexes = [name for name in LIFECYCLE_INDEXES if name not in indexes]
+    if missing_indexes:
+        problems.append(f"missing {LIFECYCLE_TABLE} indexes: " + ", ".join(missing_indexes))
     return problems
 
 
@@ -950,69 +1037,165 @@ def upsert_jobs(
     return counts
 
 
-def apply_link_observations(conn, observations: list[Any]) -> dict[str, int]:
-    """Apply validator results. Does not move synced_at.
+EVIDENCE_BATCH_SQL = """
+CREATE TEMP TABLE lifecycle_batch (
+    ord INTEGER NOT NULL,
+    job_id TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    observation TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    evidence_version TEXT NOT NULL,
+    label TEXT NOT NULL,
+    previous_link_status TEXT,
+    resulting_link_status TEXT
+) ON COMMIT DROP
+"""
 
+# Lock the batch's catalog rows and record the status each observation is applied to.
+EVIDENCE_PREVIOUS_SQL = """
+UPDATE lifecycle_batch AS b SET
+    previous_link_status = v.link_status,
+    resulting_link_status = CASE b.observation
+        WHEN 'confirmed_active' THEN 'active'
+        WHEN 'confirmed_expired' THEN 'expired'
+        ELSE v.link_status
+    END
+FROM (
+    SELECT job_id, link_status FROM validated_jobs
+    WHERE job_id IN (SELECT job_id FROM lifecycle_batch)
+    ORDER BY job_id
+    FOR UPDATE
+) AS v
+WHERE v.job_id = b.job_id
+"""
+
+# Append-only: the runtime never updates or deletes ledger rows.
+EVIDENCE_LEDGER_SQL = """
+INSERT INTO jobready_link_observations (
+    job_id, observed_at, observation, reason, provider,
+    previous_link_status, resulting_link_status, run_id, evidence_version
+)
+SELECT
+    job_id, observed_at, observation, reason, provider,
+    previous_link_status, resulting_link_status, %s, evidence_version
+FROM lifecycle_batch
+ORDER BY ord
+"""
+
+# Confirmed timestamps only move forward; inconclusive leaves both alone.
+EVIDENCE_SUMMARY_SQL = """
+UPDATE validated_jobs AS v SET
+    link_status = CASE b.observation
+        WHEN 'confirmed_active' THEN 'active'
+        WHEN 'confirmed_expired' THEN 'expired'
+        ELSE v.link_status
+    END,
+    updated_at = CASE
+        WHEN b.resulting_link_status IS DISTINCT FROM v.link_status THEN NOW()
+        ELSE v.updated_at
+    END,
+    link_checked_at = NOW(),
+    last_link_observation = b.label,
+    last_confirmed_open_at = CASE
+        WHEN b.observation = 'confirmed_active' THEN GREATEST(v.last_confirmed_open_at, b.observed_at)
+        ELSE v.last_confirmed_open_at
+    END,
+    last_confirmed_closed_at = CASE
+        WHEN b.observation = 'confirmed_expired' THEN GREATEST(v.last_confirmed_closed_at, b.observed_at)
+        ELSE v.last_confirmed_closed_at
+    END
+FROM lifecycle_batch AS b
+WHERE v.job_id = b.job_id
+"""
+
+
+def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
+    """One lifecycle_batch row. Tuples are injected results and carry no provider evidence."""
+    if isinstance(item, tuple):
+        job_id, _previous, raw = item
+        reason = raw
+        provider = INJECTED_PROVIDER
+        evidence_version = INJECTED_EVIDENCE_VERSION
+        observed_at = datetime.now(timezone.utc)
+    else:
+        job_id = item.job_id
+        raw = item.observation
+        reason = getattr(item, "reason", raw)
+        provider = item.provider or "unknown"
+        evidence_version = item.evidence_version
+        observed_at = item.observed_at
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("observation job_id is required")
+    if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be a timezone-aware datetime")
+    if not isinstance(evidence_version, str) or not evidence_version.strip():
+        raise ValueError("evidence_version is required")
+    label = raw if not reason or reason == raw else f"{raw}:{reason}"
+    observation = raw if raw in LIFECYCLE_OBSERVATIONS else "inconclusive"
+    return (
+        position,
+        job_id,
+        observed_at,
+        observation,
+        str(reason or raw)[:200],
+        str(provider)[:200],
+        evidence_version,
+        label[:200],
+    )
+
+
+def apply_link_observations(
+    conn,
+    observations: list[Any],
+    *,
+    run_id: str | None = None,
+    on_commit: Callable[[], None] | None = None,
+) -> dict[str, int]:
+    """Record validator results atomically. Does not move synced_at.
+
+    One transaction appends one ledger row per observation and updates the
+    validated_jobs summary; a failure on either side rolls back both.
     confirmed_expired and confirmed_active are the only status changes.
-    An inconclusive result records the check and leaves link_status alone.
+    An inconclusive result records the check and leaves link_status and both
+    confirmed timestamps alone. A batch holds at most one observation per job;
+    repeated observations belong in separate batches.
+    on_commit runs as soon as conn.commit() succeeds.
     """
-    counts = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0}
-    with conn.cursor() as cur:
-        for item in observations:
-            if isinstance(item, tuple):
-                job_id, _previous, observation = item
-                reason = observation
-            else:
-                job_id = item.job_id
-                observation = item.observation
-                reason = getattr(item, "reason", observation)
-            label = observation if not reason or reason == observation else f"{observation}:{reason}"
-            label = label[:200]
-            counts["checked"] += 1
-            if observation == "confirmed_expired":
-                counts["confirmed_expired"] += 1
-                cur.execute(
-                    """
-                    UPDATE validated_jobs SET
-                        link_status = 'expired',
-                        updated_at = CASE
-                            WHEN link_status IS DISTINCT FROM 'expired' THEN NOW()
-                            ELSE updated_at
-                        END,
-                        link_checked_at = NOW(),
-                        last_link_observation = %s
-                    WHERE job_id = %s
-                    """,
-                    (label, job_id),
-                )
-            elif observation == "confirmed_active":
-                counts["confirmed_active"] += 1
-                cur.execute(
-                    """
-                    UPDATE validated_jobs SET
-                        link_status = 'active',
-                        updated_at = CASE
-                            WHEN link_status IS DISTINCT FROM 'active' THEN NOW()
-                            ELSE updated_at
-                        END,
-                        link_checked_at = NOW(),
-                        last_link_observation = %s
-                    WHERE job_id = %s
-                    """,
-                    (label, job_id),
-                )
-            else:
-                counts["inconclusive"] += 1
-                cur.execute(
-                    """
-                    UPDATE validated_jobs SET
-                        link_checked_at = NOW(),
-                        last_link_observation = %s
-                    WHERE job_id = %s
-                    """,
-                    (label, job_id),
-                )
-    conn.commit()
+    rows = [_evidence_row(index, item) for index, item in enumerate(observations)]
+    job_ids = [row[1] for row in rows]
+    if len(set(job_ids)) != len(job_ids):
+        raise ValueError("one observation per job_id per batch")
+    counts = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0, "recorded": 0}
+    if not rows:
+        return counts
+    try:
+        with conn.cursor() as cur:
+            apply_write_timeouts(cur)
+            cur.execute(EVIDENCE_BATCH_SQL)
+            execute_values(
+                cur,
+                "INSERT INTO lifecycle_batch (ord, job_id, observed_at, observation, reason, provider, "
+                "evidence_version, label) VALUES %s",
+                rows,
+                page_size=len(rows),
+            )
+            cur.execute(EVIDENCE_PREVIOUS_SQL)
+            cur.execute(EVIDENCE_LEDGER_SQL, (run_id,))
+            recorded = cur.rowcount
+            cur.execute(EVIDENCE_SUMMARY_SQL)
+            if recorded != len(rows) or cur.rowcount != len(rows):
+                raise RuntimeError("lifecycle evidence batch did not match catalog rows")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    if on_commit is not None:
+        on_commit()
+    for row in rows:
+        counts["checked"] += 1
+        counts[row[3]] += 1
+    counts["recorded"] = recorded
     return counts
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
@@ -58,6 +59,14 @@ NAUKRI_FLAG_KEYS = ("isExpired", "expired", "isClosed")
 NAUKRI_CLOSED_STATUS = {"expired", "closed", "withdrawn", "inactive"}
 NAUKRI_OPEN_STATUS = {"active", "open", "live"}
 
+# Names the interpretation contract that produced an observation. Change it only when the
+# meaning of a verdict changes, never per run or per deploy.
+JOBREADY_EVIDENCE_VERSION = "jobready-validator-v1"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 @dataclass(frozen=True)
 class LinkObservation:
@@ -66,6 +75,9 @@ class LinkObservation:
     observation: str
     provider: str
     reason: str
+    # When the provider evidence was observed, not when it is written.
+    observed_at: datetime = field(default_factory=_utc_now)
+    evidence_version: str = JOBREADY_EVIDENCE_VERSION
 
 
 def interpret_indeed(*, expired: Any, key_configured: bool) -> tuple[str, str]:
@@ -395,6 +407,7 @@ def validate_candidates(rows: list[dict[str, Any]], probes: dict[str, Probe] | N
                 observation=observation,
                 provider=provider,
                 reason=reason,
+                observed_at=_utc_now(),
             )
         )
     return observations
