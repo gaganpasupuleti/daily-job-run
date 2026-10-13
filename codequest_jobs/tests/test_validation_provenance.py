@@ -7,6 +7,7 @@ Postgres named by JOBREADY_DAILY_CATALOG_URL and are skipped when it is absent.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import sys
 import tempfile
@@ -402,6 +403,81 @@ class IndeedProvenanceTests(unittest.TestCase):
             check.assert_called_once_with("0123456789abcdef")
             self.assertEqual((result.observation, result.reason), expected)
             self.assertEqual(_provenance(result), (indeed_checker.INDEED_GRAPHQL, None, None))
+
+
+class TransportLoggingTests(unittest.TestCase):
+    """Real probes under process-wide INFO logging must not let httpx print raw provider URLs."""
+
+    def setUp(self) -> None:
+        self.captured = io.StringIO()
+        handler = logging.StreamHandler(self.captured)
+        handler.setLevel(logging.DEBUG)
+        root = logging.getLogger()
+        saved_root = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+        self.addCleanup(root.setLevel, saved_root)
+        self.addCleanup(root.removeHandler, handler)
+        # The surrounding process may opt the transport loggers into INFO explicitly.
+        for name in ("httpx", "httpcore"):
+            transport = logging.getLogger(name)
+            self.addCleanup(transport.setLevel, transport.level)
+            transport.setLevel(logging.INFO)
+
+    def _run(self, probe, row: dict) -> tuple[ProbeResult, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), patch.object(sys, "stderr", stderr):
+            result = probe(row)
+            logging.getLogger("jobready.p13.marker").info("application INFO still flows")
+        return result, self.captured.getvalue() + stdout.getvalue() + stderr.getvalue()
+
+    def test_linkedin_redirect_secret_never_reaches_logs(self) -> None:
+        landing = f"https://www.linkedin.com/jobs/view/{JOB_ID}"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == GUEST:
+                return httpx.Response(
+                    302, headers={"Location": f"https://u:{SECRET}@www.linkedin.com/jobs/view/{JOB_ID}?token={SECRET}"}
+                )
+            return httpx.Response(200, text=linkedin_page())
+
+        requests, patcher = _linkedin_transport(handler)
+        with patcher:
+            result, output = self._run(probe_linkedin, LINKEDIN_ROW)
+        self.assertTrue(any(SECRET in url for url in requests.urls), "the mock must carry the secret")
+        self.assertEqual((result.observation, result.reason, result.provider), ("inconclusive", "linkedin_redirected", "linkedin"))
+        self.assertEqual(_provenance(result), (GUEST, landing, 200))
+        self.assertIn("application INFO still flows", output)
+        self.assertNotIn(SECRET, output)
+        self.assertNotIn("HTTP Request", output)
+
+    def test_naukri_request_secret_never_reaches_logs(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/jobapi/"):
+                return httpx.Response(302, headers={"Location": f"https://www.naukri.com/nlogin/login?k={SECRET}"})
+            return httpx.Response(200, json={})
+
+        requests, patcher = _naukri_transport(handler)
+        with patcher:
+            result, output = self._run(probe_naukri, NAUKRI_ROW)
+        self.assertTrue(any(SECRET in url for url in requests.urls), "the mock must carry the secret")
+        self.assertEqual((result.reason, result.http_status), ("naukri_redirected", 200))
+        self.assertIn("application INFO still flows", output)
+        self.assertNotIn(SECRET, output)
+        self.assertNotIn("HTTP Request", output)
+
+    def test_indeed_helper_transport_logging_is_quiet(self) -> None:
+        def helper(jk: str) -> str:
+            logging.getLogger("httpx").info("HTTP Request: POST https://apis.indeed.com/graphql?k=%s", SECRET)
+            return "active"
+
+        with patch.dict(os.environ, {"INDEED_API_KEY": "fixture-not-a-key"}), patch.object(
+            indeed_checker, "check_indeed_via_api", side_effect=helper
+        ):
+            result, output = self._run(probe_indeed, INDEED_ROW)
+        self.assertEqual(result.reason, "indeed_expired_false")
+        self.assertIn("application INFO still flows", output)
+        self.assertNotIn(SECRET, output)
 
 
 class WriterValidationTests(unittest.TestCase):

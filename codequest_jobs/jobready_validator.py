@@ -9,6 +9,7 @@ failure is inconclusive. A missing Apply action is not closure.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -66,6 +67,26 @@ NAUKRI_OPEN_STATUS = {"active", "open", "live"}
 # Names the interpretation contract that produced an observation. Change it only when the
 # meaning of a verdict changes, never per run or per deploy.
 JOBREADY_EVIDENCE_VERSION = "jobready-validator-v1"
+
+
+# httpx logs every request URL at INFO, query string and userinfo included, and httpcore
+# logs connection detail at DEBUG. Provider redirects can put tokens in those URLs.
+TRANSPORT_LOGGERS = ("httpx", "httpcore")
+
+
+def quiet_transport_logging() -> None:
+    """Keep provider transport loggers at WARNING or above, whatever the process configured.
+
+    Applied at import and again before every provider request, so a later INFO
+    configuration cannot re-enable raw URL logging. Other loggers are untouched.
+    """
+    for name in TRANSPORT_LOGGERS:
+        transport = logging.getLogger(name)
+        if transport.getEffectiveLevel() < logging.WARNING:
+            transport.setLevel(logging.WARNING)
+
+
+quiet_transport_logging()
 
 
 def _utc_now() -> datetime:
@@ -475,6 +496,7 @@ def probe_generic(row: dict[str, Any]) -> ProbeResult:
 def probe_indeed(row: dict[str, Any]) -> ProbeResult:
     from indeed_checker import INDEED_GRAPHQL, check_indeed_via_api, indeed_jk_from_url
 
+    quiet_transport_logging()
     if not (os.getenv("INDEED_API_KEY") or "").strip():
         observation, reason = interpret_indeed(expired=None, key_configured=False)
         return ProbeResult(observation, reason, "indeed")
@@ -489,6 +511,7 @@ def probe_indeed(row: dict[str, Any]) -> ProbeResult:
 
 
 def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
+    quiet_transport_logging()
     job_id = linkedin_job_id_from_url(row.get("job_url") or "")
     if not job_id:
         return ProbeResult(INCONCLUSIVE, "linkedin_unrecognized_url", "linkedin")
@@ -521,6 +544,7 @@ def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
 def probe_naukri(row: dict[str, Any]) -> ProbeResult:
     from link_checker import _naukri_job_id_from_url
 
+    quiet_transport_logging()
     job_id = _naukri_job_id_from_url(row.get("job_url") or "")
     if not job_id:
         return ProbeResult(INCONCLUSIVE, "naukri_unrecognized_url", "naukri")
