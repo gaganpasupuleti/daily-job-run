@@ -37,6 +37,17 @@ python codequest_jobs/run_jobready_daily.py --apply-schema
 
 `--preflight` is read-only. It checks that the catalog is reachable, `validated_jobs` exists, required columns and indexes are present, and source identities are not duplicated. It prints `host`, `port`, and database name, not a connection string. `--apply-schema` applies idempotent catalog DDL and refuses when duplicate identities exist. A normal daily run refuses if that schema is missing. It does not create the table itself.
 
+### Lifecycle evidence schema (Phase 1)
+
+`--apply-schema` also creates the lifecycle evidence objects. Nothing reads or writes them yet. Run `--apply-schema` explicitly before the slice that starts recording evidence. The daily run never creates them, and `--preflight` does not require them.
+
+- `jobready_link_observations` is append-only. Each validation attempt is one row, so repeated identical results are kept. The only uniqueness is `id`. `job_id` references `validated_jobs(job_id)` with `ON DELETE RESTRICT`, so a job that has evidence cannot be deleted. `observation` is exactly `confirmed_active`, `confirmed_expired`, or `inconclusive`. Rows hold metadata only, never page bodies, headers, cookies, tokens, or credentials.
+- `observed_at` is when the provider was probed. `recorded_at` is when the row was stored.
+- `validated_jobs.last_confirmed_open_at` and `last_confirmed_closed_at` are the latest `observed_at` of trusted `confirmed_active` and `confirmed_expired` evidence. `inconclusive` never advances either timestamp.
+- No backfill. The table starts empty, and both timestamps start `NULL`. They are not derived from `link_status`, `link_checked_at`, `last_link_observation`, `synced_at`, or `updated_at`.
+- Adding these objects changes no visibility, membership, or `link_status` behavior.
+- The foreign key needs `validated_jobs.job_id` to be unique, which `SCHEMA_SQL` declares. If a catalog lacks that constraint, `--apply-schema` fails and applies nothing.
+
 Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
 
 Required configuration: `JOB_READY_DATABASE_URL`.

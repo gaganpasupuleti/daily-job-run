@@ -266,7 +266,7 @@ class CatalogTests(unittest.TestCase):
         self.catalog.rollback()
         self.app.rollback()
         with self.catalog.cursor() as cur:
-            cur.execute("TRUNCATE validated_jobs RESTART IDENTITY")
+            cur.execute("TRUNCATE jobready_link_observations, validated_jobs RESTART IDENTITY")
         self.catalog.commit()
         with self.app.cursor() as cur:
             cur.execute("TRUNCATE jobs")
