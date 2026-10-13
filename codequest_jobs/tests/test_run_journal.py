@@ -1137,7 +1137,7 @@ class DatabaseJournalTests(unittest.TestCase):
         self.runs = self.base / "runs"
         self.catalog.rollback()
         with self.catalog.cursor() as cur:
-            cur.execute("TRUNCATE validated_jobs RESTART IDENTITY")
+            cur.execute("TRUNCATE jobready_link_observations, validated_jobs RESTART IDENTITY")
         self.catalog.commit()
         for target, value in {
             "run_jobready_daily.OUTPUT_DIR": self.base / "reports",

@@ -90,6 +90,41 @@ CREATE INDEX IF NOT EXISTS idx_validated_jobs_link_checked_at
 CREATE UNIQUE INDEX IF NOT EXISTS idx_validated_jobs_source_id_unique
     ON validated_jobs (source_id)
     WHERE source_id IS NOT NULL AND btrim(source_id) <> '';
+
+-- Lifecycle evidence (Phase 1). Starts NULL and empty: nothing is backfilled.
+-- last_confirmed_open_at / last_confirmed_closed_at: latest observed_at of a trusted
+-- confirmed_active / confirmed_expired observation. inconclusive never advances either.
+ALTER TABLE validated_jobs ADD COLUMN IF NOT EXISTS last_confirmed_open_at TIMESTAMPTZ;
+ALTER TABLE validated_jobs ADD COLUMN IF NOT EXISTS last_confirmed_closed_at TIMESTAMPTZ;
+
+-- Append-only: one row per validation attempt. Repeated identical results are legitimate,
+-- so there is no uniqueness beyond id. observed_at is when the provider was probed;
+-- recorded_at is when the row was persisted. Metadata only: no bodies, headers, or credentials.
+CREATE TABLE IF NOT EXISTS jobready_link_observations (
+    id BIGSERIAL PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    observation TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    previous_link_status TEXT,
+    resulting_link_status TEXT,
+    run_id TEXT,
+    requested_url TEXT,
+    final_url TEXT,
+    http_status INTEGER,
+    evidence_version TEXT NOT NULL,
+    CONSTRAINT jobready_link_observations_job_id_fkey
+        FOREIGN KEY (job_id) REFERENCES validated_jobs (job_id) ON DELETE RESTRICT,
+    CONSTRAINT jobready_link_observations_observation_check
+        CHECK (observation IN ('confirmed_active', 'confirmed_expired', 'inconclusive'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobready_link_observations_job_time
+    ON jobready_link_observations (job_id, observed_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_jobready_link_observations_observed_at
+    ON jobready_link_observations (observed_at DESC);
 """
 
 REQUIRED_COLUMNS = (
@@ -135,6 +170,8 @@ REQUIRED_COLUMNS = (
     "updated_at",
 )
 
+# Lifecycle evidence objects are deliberately absent from REQUIRED_COLUMNS and REQUIRED_INDEXES:
+# the daily run neither reads nor writes them, so a catalog without them must still pass.
 REQUIRED_INDEXES = (
     "idx_validated_jobs_source_id_unique",
     "idx_validated_jobs_link_checked_at",
