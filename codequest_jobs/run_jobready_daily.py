@@ -113,9 +113,9 @@ def prepare_catalog_row(job) -> dict:
     }
 
 
-def apply_observations(conn, observations) -> dict[str, int]:
+def apply_observations(conn, observations, *, run_id=None, on_commit=None) -> dict[str, int]:
     """Apply validator observations. Search presence is not an observation."""
-    return apply_link_observations(conn, observations)
+    return apply_link_observations(conn, observations, run_id=run_id, on_commit=on_commit)
 
 
 def membership_would_change(catalog_conn, app_conn) -> dict[str, int]:
@@ -212,6 +212,7 @@ def run_daily(
     starts and after it ends; failures are recorded and re-raised.
     """
     journal = journal or RunJournal.disabled()
+    run_id = journal.run_id if journal.path is not None else None
     started = datetime.now(timezone.utc)
     journal.begin("catalog_plan")
 
@@ -261,14 +262,20 @@ def run_daily(
         )
     else:
         journal.skip("catalog_write", "no_rows")
-    validation = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0}
+    validation = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0, "recorded": 0}
     validation_reasons: dict[str, int] = {}
     validation_started = time.perf_counter()
+
+    def _validation_committed() -> None:
+        journal.mark_committed("validation_write")
+
     if observations is not None:
         journal.skip("validation_select", "injected_observations")
         journal.skip("validation_probe", "injected_observations")
         with journal.stage("validation_write", committed_on_failure=False) as stage:
-            validation = apply_observations(catalog_conn, observations)
+            validation = apply_observations(
+                catalog_conn, observations, run_id=run_id, on_commit=_validation_committed
+            )
             stage.committed = True
             stage.counters.update(validation)
         _stage(f"validation selected={validation['checked']}")
@@ -288,7 +295,7 @@ def run_daily(
             built = validate_candidates(candidates, probes=probes)
             stage.counters["observed"] = len(built)
         with journal.stage("validation_write", committed_on_failure=False) as stage:
-            validation = apply_observations(catalog_conn, built)
+            validation = apply_observations(catalog_conn, built, run_id=run_id, on_commit=_validation_committed)
             stage.committed = True
             stage.counters.update(validation)
         for item in built:
@@ -335,7 +342,7 @@ def run_daily(
             "started_at": started.isoformat(),
             "finished_at": finished.isoformat(),
             "elapsed_sec": round((finished - started).total_seconds(), 3),
-            "run_id": journal.run_id if journal.path is not None else None,
+            "run_id": run_id,
             "sources_attempted": sources_attempted or sorted(health) or sorted(sources),
             "sources_successful": successful,
             "sources_failed": failed,
@@ -351,6 +358,7 @@ def run_daily(
             "confirmed_active": validation["confirmed_active"],
             "confirmed_expired": validation["confirmed_expired"],
             "unknown_or_inconclusive": validation["inconclusive"],
+            "lifecycle_observations_recorded": validation["recorded"],
             "validation_reasons": dict(sorted(validation_reasons.items())),
             "per_source_counts": sources,
             "per_family_counts": families,

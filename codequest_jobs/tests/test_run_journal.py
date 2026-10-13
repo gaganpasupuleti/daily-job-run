@@ -122,6 +122,24 @@ class _CommitFailingConnection:
         return getattr(self._inner, name)
 
 
+class _NthCommitFailingConnection:
+    """A real connection whose Nth commit fails without committing; other commits are real."""
+
+    def __init__(self, inner, *, fail_on: int) -> None:
+        self._inner = inner
+        self._fail_on = fail_on
+        self.commit_attempts = 0
+
+    def commit(self) -> None:
+        self.commit_attempts += 1
+        if self.commit_attempts == self._fail_on:
+            raise psycopg2.OperationalError("server closed the connection during commit")
+        self._inner.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class _FakeLock:
     def __init__(self, harness: "MockedRunTests") -> None:
         self.harness = harness
@@ -227,9 +245,18 @@ class MockedRunTests(unittest.TestCase):
             for row in candidates
         ]
 
-    def apply(self, conn, built) -> dict:
+    def apply(self, conn, built, *, run_id=None, on_commit=None) -> dict:
         self.hook("validation_write")
-        return {"checked": len(built), "confirmed_active": len(built), "confirmed_expired": 0, "inconclusive": 0}
+        if on_commit is not None:
+            on_commit()
+        self.hook("validation_post_commit")
+        return {
+            "checked": len(built),
+            "confirmed_active": len(built),
+            "confirmed_expired": 0,
+            "inconclusive": 0,
+            "recorded": len(built),
+        }
 
     def membership(self, catalog_conn, app_conn) -> dict:
         self.hook("membership_count")
@@ -615,6 +642,16 @@ class MockedRunTests(unittest.TestCase):
         at_failure = dict(self.events)["catalog_post_commit"]
         self.assertEqual(at_failure["stages"]["catalog_write"]["status"], "running")
         self.assertIs(at_failure["stages"]["catalog_write"]["committed"], True)
+
+    def test_validation_post_commit_failure_keeps_committed_true(self) -> None:
+        journal = self.run_failing("validation_post_commit", BrokenPipeError(32, "Broken pipe"))
+        write = journal["stages"]["validation_write"]
+        self.assertEqual(journal["failed_stage"], "validation_write")
+        self.assertEqual(write["status"], "failed")
+        self.assertIs(write["committed"], True)
+        at_failure = dict(self.events)["validation_post_commit"]
+        self.assertEqual(at_failure["stages"]["validation_write"]["status"], "running")
+        self.assertIs(at_failure["stages"]["validation_write"]["committed"], True)
 
     def test_failure_before_commit_is_not_committed(self) -> None:
         journal = self.run_failing("catalog_write", RuntimeError("write failed before commit"))
@@ -1221,6 +1258,34 @@ class DatabaseJournalTests(unittest.TestCase):
         self.assertIs(journal["stages"]["validation_write"]["committed"], False)
         self.assertIs(journal["stages"]["catalog_write"]["committed"], True)
         self.assertEqual(self._count("link_checked_at IS NOT NULL"), 0)
+
+    def _ledger(self) -> list[tuple]:
+        self.catalog.rollback()
+        with self.catalog.cursor() as cur:
+            cur.execute("SELECT run_id, observation FROM jobready_link_observations ORDER BY id")
+            return cur.fetchall()
+
+    def test_real_lifecycle_evidence_carries_run_id(self) -> None:
+        report = self._run()
+        journal = self._journal()
+        self.assertIs(journal["stages"]["validation_write"]["committed"], True)
+        self.assertEqual(self._ledger(), [(journal["run_id"], "confirmed_active")])
+        self.assertEqual(report["run_id"], journal["run_id"])
+        self.assertEqual(report["lifecycle_observations_recorded"], 1)
+        self.assertEqual(journal["stages"]["validation_write"]["counters"]["recorded"], 1)
+
+    def test_real_validation_commit_failure_is_not_committed(self) -> None:
+        connection = _NthCommitFailingConnection(catalog.connect(CATALOG_URL), fail_on=2)
+        with patch("run_jobready_daily._open_catalog", lambda: connection):
+            with self.assertRaises(psycopg2.OperationalError):
+                self._run()
+        journal = self._journal()
+        self.assertIs(journal["stages"]["catalog_write"]["committed"], True)
+        self.assertEqual(journal["failed_stage"], "validation_write")
+        self.assertIs(journal["stages"]["validation_write"]["committed"], False)
+        self.assertEqual(self._count(), 1)
+        self.assertEqual(self._count("link_checked_at IS NOT NULL"), 0)
+        self.assertEqual(self._ledger(), [])
 
     # Phase 0 closure: real commit, then the completion print fails
     def test_real_commit_then_logging_failure_never_records_uncommitted(self) -> None:

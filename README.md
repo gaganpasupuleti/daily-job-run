@@ -39,13 +39,15 @@ python codequest_jobs/run_jobready_daily.py --apply-schema
 
 ### Lifecycle evidence schema (Phase 1)
 
-`--apply-schema` also creates the lifecycle evidence objects. Nothing reads or writes them yet. Run `--apply-schema` explicitly before the slice that starts recording evidence. The daily run never creates them, and `--preflight` does not require them.
+`--apply-schema` creates the lifecycle evidence objects. The daily run and `--preflight` require them: a missing or incomplete ledger (columns, foreign key, observation check, or indexes) is reported as `SCHEMA_REQUIRED` / `PREFLIGHT_FAILED`. The daily run never creates them.
+
+Each validation batch is one transaction. It appends one ledger row per observation and updates `link_status`, `link_checked_at`, `last_link_observation`, and the confirmed timestamps. If either part fails, both roll back, and the journal shows `validation_write` `committed: false`. Ledger rows carry the journal `run_id`, the probe's `provider` and `reason`, and `evidence_version` (`jobready-validator-v1` for validator results). `previous_link_status` is the catalog status the observation was applied to. A batch holds at most one observation per job. The runtime only inserts ledger rows; it never updates or deletes them. `requested_url`, `final_url`, and `http_status` stay `NULL` for now. The daily report adds `lifecycle_observations_recorded`.
 
 - `jobready_link_observations` is append-only. Each validation attempt is one row, so repeated identical results are kept. The only uniqueness is `id`. `job_id` references `validated_jobs(job_id)` with `ON DELETE RESTRICT`, so a job that has evidence cannot be deleted. `observation` is exactly `confirmed_active`, `confirmed_expired`, or `inconclusive`. Rows hold metadata only, never page bodies, headers, cookies, tokens, or credentials.
 - `observed_at` is when the provider was probed. `recorded_at` is when the row was stored.
-- `validated_jobs.last_confirmed_open_at` and `last_confirmed_closed_at` are the latest `observed_at` of trusted `confirmed_active` and `confirmed_expired` evidence. `inconclusive` never advances either timestamp.
-- No backfill. The table starts empty, and both timestamps start `NULL`. They are not derived from `link_status`, `link_checked_at`, `last_link_observation`, `synced_at`, or `updated_at`.
-- Adding these objects changes no visibility, membership, or `link_status` behavior.
+- `validated_jobs.last_confirmed_open_at` and `last_confirmed_closed_at` are the latest `observed_at` of trusted `confirmed_active` and `confirmed_expired` evidence. They never move backward when older evidence arrives. `inconclusive` never advances either timestamp.
+- No backfill. Only validator observations made after this runtime is active create ledger rows or set the timestamps. They are not derived from `link_status`, `link_checked_at`, `last_link_observation`, `synced_at`, or `updated_at`.
+- Recording evidence changes no visibility, membership, or `link_status` behavior.
 - The foreign key needs `validated_jobs.job_id` to be unique, which `SCHEMA_SQL` declares. If a catalog lacks that constraint, `--apply-schema` fails and applies nothing.
 
 Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
