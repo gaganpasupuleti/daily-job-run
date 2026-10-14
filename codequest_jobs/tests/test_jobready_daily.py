@@ -7,12 +7,14 @@ and JOBREADY_DAILY_APP_URL. They are skipped when those variables are absent.
 from __future__ import annotations
 
 import inspect
+import io
 import os
 import sys
 import threading
 import time
 import unittest
 import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,14 +152,11 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("verify=False", duplicate)
 
     def test_prune_is_refused_before_a_database_connection(self) -> None:
-        previous = sys.argv
-        sys.argv = ["push_validated_to_job_ready.py", "--prune", "--max-age-days", "1"]
-        try:
-            with self.assertRaises(SystemExit) as caught:
-                push.main()
-        finally:
-            sys.argv = previous
-        self.assertIn("PRUNE_REFUSED", str(caught.exception))
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = push.main(["--prune", "--max-age-days", "1"])
+        self.assertEqual(code, push.EXIT_RETIRED)
+        self.assertEqual(stdout.getvalue().strip(), push.RETIRED_MESSAGE)
 
     def test_experience_buckets_use_the_jobready_vocabulary(self) -> None:
         from jobready_catalog import catalog_experience_bucket

@@ -5,8 +5,9 @@ The daily command is `python codequest_jobs/run_jobready_daily.py`. These files 
 ## Retired commands
 
 - `codequest_jobs/prune_job_ready_now.py` is RETIRED. It used to delete every JobReady catalog row that was not active in CodeQuest `scraped_jobs`, then reconcile application membership. Every invocation now prints `RETIRED_COMMAND prune_job_ready_now` and exits with code 2. It reads no database variable and opens no connection. No flag re-enables it. Do not use it for JobReady catalog maintenance.
+- `codequest_jobs/push_validated_to_job_ready.py` is RETIRED. It used to copy active rows from CodeQuest `scraped_jobs` into `validated_jobs` and overwrite `link_status` with CodeQuest's value, so it could reactivate an expired row without a validator observation, a `jobready_link_observations` row, or a newer `last_confirmed_open_at`. Every invocation now prints `RETIRED_COMMAND push_validated_to_job_ready` and exits with code 2. It reads no database variable, opens no connection, writes no run log, and runs no schema SQL. No flag re-enables it, including the old `--max-age-days`, `--prune`, and `--confirm-target`. The frozen copy `link_validator_service/push_validated_to_job_ready.py` delegates to it and is retired the same way.
 
-CodeQuest is not authoritative for JobReady catalog membership. Catalog lifecycle changes come from the JobReady collector and validator in `run_jobready_daily.py`. Application membership reconciliation is the separate guarded `codequest_jobs/sync_job_ready_ui.py`.
+CodeQuest `scraped_jobs` is not authoritative for JobReady lifecycle state. CodeQuest is not authoritative for JobReady catalog membership. Catalog lifecycle changes come from the JobReady collector and validator in `run_jobready_daily.py`. Application membership reconciliation is the separate guarded `codequest_jobs/sync_job_ready_ui.py`.
 
 ## CodeQuest and local scraper writes
 
@@ -17,7 +18,6 @@ CodeQuest is not authoritative for JobReady catalog membership. Catalog lifecycl
 - `naukri_jobs_scraper/verify_db.py`
 - `naukri_jobs_scraper/verify_production.py`
 - `naukri_jobs_scraper/push_json_to_db.py`
-- `codequest_jobs/push_validated_to_job_ready.py` (`--prune` is refused)
 - `codequest_jobs/db.py`
 - `codequest_jobs/run_jobs_pipeline.py`
 
