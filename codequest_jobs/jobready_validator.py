@@ -24,7 +24,10 @@ from link_policy import (
     CONFIRMED_ACTIVE,
     CONFIRMED_EXPIRED,
     INCONCLUSIVE,
+    UNSUPPORTED_SOURCE,
+    normalize_source,
     sanitize_evidence_url,
+    source_label,
     valid_http_status,
 )
 from linkedin_checker import CLOSED_MARKERS, GUEST_URL, HEADERS, linkedin_job_id_from_url
@@ -442,25 +445,41 @@ def interpret_naukri(
     return INCONCLUSIVE, "naukri_no_status_evidence"
 
 
-def interpret_generic(source: str) -> tuple[str, str]:
-    return INCONCLUSIVE, f"{source or 'unknown'}_no_explicit_closure"
+class UnsupportedSourceError(ValueError):
+    """Rows on sources without a lifecycle probe were passed for validation. Nothing was probed."""
+
+    def __init__(self, sources: list[str]) -> None:
+        super().__init__(UNSUPPORTED_SOURCE)
+        self.sources = sources
+
+
+def probe_for(source: Any, probes: dict[str, Probe] | None = None) -> Probe | None:
+    """The probe for a source, or None when the source has no lifecycle probe.
+
+    Production uses default_probes(). Injected probes are matched by exact normalized source.
+    """
+    chosen = probes if probes is not None else default_probes()
+    return chosen.get(normalize_source(source))
 
 
 def validate_candidates(rows: list[dict[str, Any]], probes: dict[str, Probe] | None = None) -> list[LinkObservation]:
     """Return one observation per catalog row. Probes are injectable so tests stay offline.
 
-    A probe that raises is recorded as inconclusive for that row only.
+    Every row must have a probe; otherwise UnsupportedSourceError is raised before any
+    probe runs. A probe that raises is recorded as inconclusive for that row only.
     """
     chosen = probes if probes is not None else default_probes()
-    generic = chosen.get("generic", probe_generic)
+    unsupported = sorted({source_label(row.get("source")) for row in rows if probe_for(row.get("source"), chosen) is None})
+    if unsupported:
+        raise UnsupportedSourceError(unsupported)
     observations: list[LinkObservation] = []
     for row in rows:
-        source = (row.get("source") or "").strip().lower()
-        probe = chosen.get(source, generic)
+        source = normalize_source(row.get("source"))
+        probe = chosen[source]
         try:
             result = probe_result(probe(row))
         except Exception:
-            result = ProbeResult(INCONCLUSIVE, f"{source or 'unknown'}_probe_error", source or "unknown")
+            result = ProbeResult(INCONCLUSIVE, f"{source}_probe_error", source)
         observations.append(
             LinkObservation(
                 job_id=row["job_id"],
@@ -478,19 +497,12 @@ def validate_candidates(rows: list[dict[str, Any]], probes: dict[str, Probe] | N
 
 
 def default_probes() -> dict[str, Probe]:
+    """Provider lifecycle probes. The keys are link_policy.SUPPORTED_LIFECYCLE_SOURCES; there is no fallback."""
     return {
         "indeed": probe_indeed,
         "linkedin": probe_linkedin,
         "naukri": probe_naukri,
-        "generic": probe_generic,
     }
-
-
-def probe_generic(row: dict[str, Any]) -> ProbeResult:
-    """No provider request is made, so there is no HTTP provenance."""
-    source = row.get("source") or ""
-    observation, reason = interpret_generic(source)
-    return ProbeResult(observation, reason, source or "unknown")
 
 
 def probe_indeed(row: dict[str, Any]) -> ProbeResult:

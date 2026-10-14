@@ -134,11 +134,15 @@ class ObservationTests(unittest.TestCase):
         result = audit("naukri", "expired", naukri_probe(payload=payload))
         self.assertEqual((result["persisted_status"], result["observation"]), ("expired", "confirmed_active"))
 
-    def test_generic_providers_are_inconclusive_without_network(self) -> None:
+    def test_unsupported_sources_are_labelled_without_a_probe(self) -> None:
         for source in ("foundit", "google", "", None):
-            result = audit_job_ready.audit_row(row("CQJ-1", source, "active"))
-            self.assertEqual(result["observation"], "inconclusive", source)
-            self.assertTrue(result["reason"].endswith("_no_explicit_closure"), result["reason"])
+            with mock.patch("jobready_validator.httpx.Client", side_effect=AssertionError("network")):
+                result = audit_job_ready.audit_row(row("CQJ-1", source, "active"))
+            self.assertEqual(
+                (result["observation"], result["reason"], result["provider"]),
+                ("unsupported", "unsupported_source", None),
+                source,
+            )
 
     def test_missing_indeed_key_is_inconclusive_without_network(self) -> None:
         with mock.patch.dict(os.environ, {"INDEED_API_KEY": ""}):

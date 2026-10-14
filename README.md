@@ -10,7 +10,9 @@ The pipeline scrapes configured boards, normalizes and dedupes the rows, classif
 python codequest_jobs/run_jobready_daily.py
 ```
 
-That command scrapes, upserts the catalog, then validates a rotating slice of `validated_jobs`. The default validation budget is 200 rows. Up to half of that budget is reserved for new jobs and re-observed jobs that have never received a conclusive check. The rest of the budget walks the oldest `link_checked_at`, so a normal day keeps moving through the catalog. `--full-audit` checks every row. `--validation-limit` changes the budget.
+That command scrapes, upserts the catalog, then validates a rotating slice of `validated_jobs`. The default validation budget is 200 rows. Up to half of that budget is reserved for new jobs and re-observed jobs that have never received a conclusive check. The rest of the budget walks the oldest `link_checked_at`, so a normal day keeps moving through the catalog. `--full-audit` checks every row on a supported source. `--validation-limit` changes the budget.
+
+Only LinkedIn, Naukri, and Indeed have a lifecycle validator (`SUPPORTED_LIFECYCLE_SOURCES` in `codequest_jobs/link_policy.py`). Every other source, including Google, Foundit, a blank source, and any new source, is unsupported. Unsupported rows are never selected, so they use no validation budget, including the priority half. They are never probed and get no ledger row, and their `link_status`, `link_checked_at`, `last_link_observation`, and confirmed timestamps do not change. Unsupported does not mean closed, open, or failed: no lifecycle evidence exists for that source. The daily report lists them as `catalog_unsupported_rows` and `catalog_unsupported_by_source`; `catalog_supported_rows` + `catalog_unsupported_rows` = `catalog_total`. `validation_selected` is the number of supported rows selected, and `validated_checked`, `confirmed_active`, `confirmed_expired`, and `unknown_or_inconclusive` count only those rows.
 
 A job found by search starts active. Seeing it in search again does not change `link_status`. An expired row stays expired until the validator returns `confirmed_active` observed after the row's last confirmed closure. Only `confirmed_expired` observed after the row's last confirmed open marks a row expired. Link checks update `link_checked_at` and do not move `synced_at`.
 
@@ -24,7 +26,7 @@ A conclusive check needs evidence for the same job. The response must come from 
   - a page where the top card cannot be identified.
 - Naukri needs an explicit status field for the same job id. A title alone is inconclusive.
 - Indeed needs a true or false `expired` flag for the requested job key. A missing, null, or text value is inconclusive.
-- Google, Foundit, and other sources are inconclusive.
+- Google, Foundit, and other sources are unsupported, not inconclusive. `audit_job_ready.py` reports them as `unsupported` with reason `unsupported_source`, without a request, and counts them apart from `checked`.
 
 Inconclusive keeps the previous `link_status`. The daily report counts each observation and reason under `validation_reasons`.
 

@@ -14,6 +14,32 @@ CONFIRMED_EXPIRED = "confirmed_expired"
 CONFIRMED_ACTIVE = "confirmed_active"
 INCONCLUSIVE = "inconclusive"
 
+# Lifecycle validation capability of a catalog source. Unsupported means no provider
+# lifecycle adapter exists: it is not closed, not open, and not a provider failure.
+SUPPORTED = "supported"
+UNSUPPORTED = "unsupported"
+UNSUPPORTED_SOURCE = "unsupported_source"
+# Sources with a provider lifecycle probe in jobready_validator.default_probes().
+SUPPORTED_LIFECYCLE_SOURCES = frozenset({"indeed", "linkedin", "naukri"})
+_SOURCE_LABEL_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
+
+
+def normalize_source(source: Any) -> str:
+    return source.strip().lower() if isinstance(source, str) else ""
+
+
+def lifecycle_capability(source: Any) -> str:
+    """SUPPORTED only for a source with a provider lifecycle probe. Blank and unknown are UNSUPPORTED."""
+    return SUPPORTED if normalize_source(source) in SUPPORTED_LIFECYCLE_SOURCES else UNSUPPORTED
+
+
+def source_label(source: Any) -> str:
+    """A bounded report key for a source: 'unknown' when blank, 'other' when not a plain identifier."""
+    normalized = normalize_source(source)
+    if not normalized:
+        return "unknown"
+    return normalized if _SOURCE_LABEL_RE.fullmatch(normalized) else "other"
+
 # These observations must never expire a catalog row.
 INCONCLUSIVE_OBSERVATIONS = {
     "unknown",
