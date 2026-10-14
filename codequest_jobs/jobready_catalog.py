@@ -1058,16 +1058,22 @@ CREATE TEMP TABLE lifecycle_batch (
 """
 
 # Lock the batch's catalog rows and record the status each observation is applied to.
+# Confirmed evidence changes status only when strictly newer than the opposite
+# confirmed timestamp; stale or simultaneous contradictory evidence keeps it.
 EVIDENCE_PREVIOUS_SQL = """
 UPDATE lifecycle_batch AS b SET
     previous_link_status = v.link_status,
-    resulting_link_status = CASE b.observation
-        WHEN 'confirmed_active' THEN 'active'
-        WHEN 'confirmed_expired' THEN 'expired'
+    resulting_link_status = CASE
+        WHEN b.observation = 'confirmed_active'
+            AND (v.last_confirmed_closed_at IS NULL OR b.observed_at > v.last_confirmed_closed_at)
+            THEN 'active'
+        WHEN b.observation = 'confirmed_expired'
+            AND (v.last_confirmed_open_at IS NULL OR b.observed_at > v.last_confirmed_open_at)
+            THEN 'expired'
         ELSE v.link_status
     END
 FROM (
-    SELECT job_id, link_status FROM validated_jobs
+    SELECT job_id, link_status, last_confirmed_open_at, last_confirmed_closed_at FROM validated_jobs
     WHERE job_id IN (SELECT job_id FROM lifecycle_batch)
     ORDER BY job_id
     FOR UPDATE
@@ -1093,11 +1099,7 @@ ORDER BY ord
 # Confirmed timestamps only move forward; inconclusive leaves both alone.
 EVIDENCE_SUMMARY_SQL = """
 UPDATE validated_jobs AS v SET
-    link_status = CASE b.observation
-        WHEN 'confirmed_active' THEN 'active'
-        WHEN 'confirmed_expired' THEN 'expired'
-        ELSE v.link_status
-    END,
+    link_status = b.resulting_link_status,
     updated_at = CASE
         WHEN b.resulting_link_status IS DISTINCT FROM v.link_status THEN NOW()
         ELSE v.updated_at
@@ -1176,8 +1178,9 @@ def apply_link_observations(
 
     One transaction appends one ledger row per observation and updates the
     validated_jobs summary; a failure on either side rolls back both.
-    confirmed_expired and confirmed_active are the only status changes.
-    An inconclusive result records the check and leaves link_status and both
+    confirmed_expired and confirmed_active are the only status changes, and
+    only when observed_at is newer than the opposite confirmed timestamp;
+    stale evidence is recorded but keeps link_status. An inconclusive result records the check and leaves link_status and both
     confirmed timestamps alone. A batch holds at most one observation per job;
     repeated observations belong in separate batches.
     on_commit runs as soon as conn.commit() succeeds.

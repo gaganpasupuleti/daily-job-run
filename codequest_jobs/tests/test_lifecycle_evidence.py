@@ -437,6 +437,116 @@ class LifecycleWriterTests(unittest.TestCase):
         self.assertEqual((state["link_status"], state["last_confirmed_closed_at"]), ("expired", T10))
         self.assertEqual(self._ledger(job_id)[0]["observed_at"], T09)
 
+    def _assert_status_kept(self, job_id: str, before: dict, *, observation: str, observed_at: datetime) -> None:
+        after = self._state(job_id)
+        self.assertEqual(after["link_status"], before["link_status"])
+        self.assertEqual(after["updated_at"], before["updated_at"])
+        (row,) = self._ledger(job_id)
+        self.assertEqual((row["observation"], row["observed_at"]), (observation, observed_at))
+        self.assertEqual(row["previous_link_status"], before["link_status"])
+        self.assertEqual(row["resulting_link_status"], before["link_status"])
+
+    def test_stale_confirmed_active_does_not_reopen_a_newer_closure(self) -> None:
+        (job_id,) = self._seed(1)
+        self._set(job_id, status="expired", opened=T09, closed=T11)
+        before = self._state(job_id)
+        result = self._apply([_obs(job_id, "confirmed_active", T10, previous="expired")])
+        self._assert_status_kept(job_id, before, observation="confirmed_active", observed_at=T10)
+        state = self._state(job_id)
+        self.assertEqual((state["last_confirmed_open_at"], state["last_confirmed_closed_at"]), (T10, T11))
+        self.assertEqual(result["confirmed_active"], 1)
+
+    def test_stale_confirmed_expired_does_not_close_a_newer_open(self) -> None:
+        (job_id,) = self._seed(1)
+        self._set(job_id, status="active", opened=T11, closed=T09)
+        before = self._state(job_id)
+        result = self._apply([_obs(job_id, "confirmed_expired", T10)])
+        self._assert_status_kept(job_id, before, observation="confirmed_expired", observed_at=T10)
+        state = self._state(job_id)
+        self.assertEqual((state["last_confirmed_open_at"], state["last_confirmed_closed_at"]), (T11, T10))
+        self.assertEqual(result["confirmed_expired"], 1)
+
+    def test_simultaneous_contradictory_evidence_keeps_the_status(self) -> None:
+        expired_id, active_id = self._seed(2)
+        self._set(expired_id, status="expired", closed=T10)
+        self._set(active_id, status="active", opened=T10)
+        before = {job_id: self._state(job_id) for job_id in (expired_id, active_id)}
+        self._apply(
+            [
+                _obs(expired_id, "confirmed_active", T10, previous="expired"),
+                _obs(active_id, "confirmed_expired", T10),
+            ]
+        )
+        self._assert_status_kept(expired_id, before[expired_id], observation="confirmed_active", observed_at=T10)
+        self._assert_status_kept(active_id, before[active_id], observation="confirmed_expired", observed_at=T10)
+
+    def test_newer_confirmed_evidence_still_changes_status(self) -> None:
+        reopen_id, close_id, legacy_expired_id, legacy_active_id = self._seed(4)
+        self._set(reopen_id, status="expired", opened=T09, closed=T10)
+        self._set(close_id, status="active", opened=T10, closed=T09)
+        self._set(legacy_expired_id, status="expired")
+        self._apply(
+            [
+                _obs(reopen_id, "confirmed_active", T11, previous="expired"),
+                _obs(close_id, "confirmed_expired", T11),
+                _obs(legacy_expired_id, "confirmed_active", T10, previous="expired"),
+                _obs(legacy_active_id, "confirmed_expired", T10),
+            ]
+        )
+        expected = {
+            reopen_id: ("active", T11, T10, "expired"),
+            close_id: ("expired", T10, T11, "active"),
+            legacy_expired_id: ("active", T10, None, "expired"),
+            legacy_active_id: ("expired", None, T10, "active"),
+        }
+        for job_id, (status, opened, closed, previous) in expected.items():
+            state = self._state(job_id)
+            self.assertEqual(
+                (state["link_status"], state["last_confirmed_open_at"], state["last_confirmed_closed_at"]),
+                (status, opened, closed),
+                job_id,
+            )
+            (row,) = self._ledger(job_id)
+            self.assertEqual((row["previous_link_status"], row["resulting_link_status"]), (previous, status), job_id)
+
+    def test_stale_and_fresh_evidence_in_one_batch_resolve_per_row(self) -> None:
+        stale_id, fresh_id, unknown_id = self._seed(3)
+        for job_id in (stale_id, fresh_id):
+            self._set(job_id, status="active", opened=T10)
+        self._set(unknown_id, status="expired", closed=T10)
+        before = self._state(unknown_id)
+        result = self._apply(
+            [
+                _obs(stale_id, "confirmed_expired", T09),
+                _obs(fresh_id, "confirmed_expired", T11),
+                _obs(unknown_id, "inconclusive", T11, previous="expired"),
+            ],
+            run_id="run-ordering",
+        )
+        self.assertEqual(
+            result, {"checked": 3, "confirmed_active": 0, "confirmed_expired": 2, "inconclusive": 1, "recorded": 3}
+        )
+        self.assertEqual(self._state(stale_id)["link_status"], "active")
+        self.assertEqual(self._state(fresh_id)["link_status"], "expired")
+        after = self._state(unknown_id)
+        self.assertEqual(
+            (after["link_status"], after["last_confirmed_open_at"], after["last_confirmed_closed_at"]),
+            (before["link_status"], before["last_confirmed_open_at"], before["last_confirmed_closed_at"]),
+        )
+        self.assertEqual(
+            sorted((row["job_id"], row["resulting_link_status"]) for row in self._ledger()),
+            sorted([(stale_id, "active"), (fresh_id, "expired"), (unknown_id, "expired")]),
+        )
+
+    def test_injected_confirmed_expired_still_applies_now(self) -> None:
+        (job_id,) = self._seed(1)
+        self._set(job_id, status="active", opened=T10)
+        self.assertEqual(catalog.mark_confirmed_expired(self.conn, [job_id]), 1)
+        state = self._state(job_id)
+        self.assertEqual(state["link_status"], "expired")
+        (row,) = self._ledger(job_id)
+        self.assertEqual((row["provider"], row["resulting_link_status"]), (catalog.INJECTED_PROVIDER, "expired"))
+
     # 15 B: ledger failure rolls back the summary.
     def test_ledger_failure_rolls_back_status_and_timestamps(self) -> None:
         (job_id,) = self._seed(1)

@@ -12,7 +12,7 @@ python codequest_jobs/run_jobready_daily.py
 
 That command scrapes, upserts the catalog, then validates a rotating slice of `validated_jobs`. The default validation budget is 200 rows. Up to half of that budget is reserved for new jobs and re-observed jobs that have never received a conclusive check. The rest of the budget walks the oldest `link_checked_at`, so a normal day keeps moving through the catalog. `--full-audit` checks every row. `--validation-limit` changes the budget.
 
-A job found by search starts active. Seeing it in search again does not change `link_status`. An expired row stays expired until the validator returns `confirmed_active`. Only `confirmed_expired` marks a row expired. Link checks update `link_checked_at` and do not move `synced_at`.
+A job found by search starts active. Seeing it in search again does not change `link_status`. An expired row stays expired until the validator returns `confirmed_active` observed after the row's last confirmed closure. Only `confirmed_expired` observed after the row's last confirmed open marks a row expired. Link checks update `link_checked_at` and do not move `synced_at`.
 
 A conclusive check needs evidence for the same job. The response must come from that job's provider endpoint over HTTPS on the provider's own host and default port, without a redirect elsewhere. It must carry the same job id and state its status:
 
@@ -57,8 +57,9 @@ HTTP provenance is evidence only. It does not change how observations are interp
 - `jobready_link_observations` is append-only. Each validation attempt is one row, so repeated identical results are kept. The only uniqueness is `id`. `job_id` references `validated_jobs(job_id)` with `ON DELETE RESTRICT`, so a job that has evidence cannot be deleted. `observation` is exactly `confirmed_active`, `confirmed_expired`, or `inconclusive`. Rows hold metadata only, never page bodies, headers, cookies, tokens, or credentials.
 - `observed_at` is when the provider was probed. `recorded_at` is when the row was stored.
 - `validated_jobs.last_confirmed_open_at` and `last_confirmed_closed_at` are the latest `observed_at` of trusted `confirmed_active` and `confirmed_expired` evidence. They never move backward when older evidence arrives. `inconclusive` never advances either timestamp.
+- Confirmed evidence changes `link_status` only when its `observed_at` is strictly later than the opposite confirmed timestamp. Older or simultaneous contradictory evidence is still recorded and still advances its own timestamp, but the ledger row's `resulting_link_status` equals its `previous_link_status` and the row keeps its status. A row with no opposite confirmed timestamp follows the observation, as before.
 - No backfill. Only validator observations made after this runtime is active create ledger rows or set the timestamps. They are not derived from `link_status`, `link_checked_at`, `last_link_observation`, `synced_at`, or `updated_at`.
-- Recording evidence changes no visibility, membership, or `link_status` behavior.
+- Recording evidence changes no visibility or membership behavior. `link_status` follows the ordering rule above.
 - The foreign key needs `validated_jobs.job_id` to be unique, which `SCHEMA_SQL` declares. If a catalog lacks that constraint, `--apply-schema` fails and applies nothing.
 
 Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
