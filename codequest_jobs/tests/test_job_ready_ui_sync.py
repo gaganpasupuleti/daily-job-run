@@ -56,17 +56,17 @@ class SafetyTests(unittest.TestCase):
         import audit_job_ready
 
         original_fetch = audit_job_ready.fetch_job_ready_rows
-        original_sync = audit_job_ready.sync_dead_to_job_ready
+        original_archive = sync.archive_ui_jobs_not_in_catalog
         calls: list[str] = []
         audit_job_ready.fetch_job_ready_rows = lambda: []
-        audit_job_ready.sync_dead_to_job_ready = lambda *args, **kwargs: calls.append("sync")
+        sync.archive_ui_jobs_not_in_catalog = lambda **kwargs: calls.append("archive")
         try:
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 code = audit_job_ready.main([])
         finally:
             audit_job_ready.fetch_job_ready_rows = original_fetch
-            audit_job_ready.sync_dead_to_job_ready = original_sync
+            sync.archive_ui_jobs_not_in_catalog = original_archive
         self.assertEqual(code, 0)
         self.assertEqual(calls, [])
         self.assertIn("will not be modified", stdout.getvalue())
@@ -99,9 +99,9 @@ class SafetyTests(unittest.TestCase):
                 "start_validation_run",
                 "finish_validation_run",
                 "status_summary",
-                "sync_dead_to_job_ready",
             )
         }
+        original_archive = sync.archive_ui_jobs_not_in_catalog
         calls: list[str] = []
         validate_links.fetch_jobs = lambda **kwargs: [
             ("1", "J1", "board", "http://example.test/j", "", "active")
@@ -111,7 +111,7 @@ class SafetyTests(unittest.TestCase):
         validate_links.start_validation_run = lambda **kwargs: ("run", None)
         validate_links.finish_validation_run = lambda *args, **kwargs: None
         validate_links.status_summary = lambda: {"by_status": {}}
-        validate_links.sync_dead_to_job_ready = lambda *args, **kwargs: calls.append("app")
+        sync.archive_ui_jobs_not_in_catalog = lambda **kwargs: calls.append("app")
         previous = sys.argv
         sys.argv = ["validate_links.py", "--env-file", str(REPO / "missing.env")]
         try:
@@ -120,12 +120,13 @@ class SafetyTests(unittest.TestCase):
                 validate_links.main()
         finally:
             sys.argv = previous
+            sync.archive_ui_jobs_not_in_catalog = original_archive
             for name, original in originals.items():
                 setattr(validate_links, name, original)
         self.assertEqual(calls, ["codequest"])
         self.assertIn("will not be modified", stdout.getvalue())
 
-    def test_validate_links_sync_flag_requires_confirmation_before_fetch(self) -> None:
+    def test_validate_links_retired_sync_flag_is_refused_before_fetch(self) -> None:
         import validate_links
 
         fetched: list[int] = []
@@ -134,12 +135,14 @@ class SafetyTests(unittest.TestCase):
         previous = sys.argv
         sys.argv = ["validate_links.py", "--sync-job-ready-every", "1", "--env-file", str(REPO / "missing.env")]
         try:
-            with self.assertRaises(SystemExit) as caught:
+            stdout = io.StringIO()
+            with self.assertRaises(SystemExit) as caught, redirect_stdout(stdout):
                 validate_links.main()
         finally:
             sys.argv = previous
             validate_links.fetch_jobs = original_fetch
-        self.assertIn("explicit target confirmation", str(caught.exception))
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(stdout.getvalue().splitlines()[0], "JOBREADY_SYNC_RETIRED")
         self.assertEqual(fetched, [])
 
     def test_indeed_key_is_not_hardcoded(self) -> None:

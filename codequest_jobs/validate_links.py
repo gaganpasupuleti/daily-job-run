@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Full link validation for scraped_jobs — concurrent HTTP + Naukri API for Naukri URLs."""
+"""Full link validation for scraped_jobs — concurrent HTTP + Naukri API for Naukri URLs.
+
+This command never writes the JobReady catalog or the JobReady application
+database. Catalog lifecycle changes come from run_jobready_daily.py; application
+membership is sync_job_ready_ui.py. The retired --sync-job-ready-every and
+--confirm-target options are refused before any environment or database access.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +41,13 @@ from link_checker import (
 )
 
 OUTPUT_DIR = ROOT / "output"
+JOBREADY_SYNC_RETIRED = "JOBREADY_SYNC_RETIRED"
+JOBREADY_SYNC_RETIRED_HELP = (
+    "validate_links.py no longer writes the JobReady catalog or application database.\n"
+    "Catalog lifecycle changes come from codequest_jobs/run_jobready_daily.py.\n"
+    "Application membership reconciliation is codequest_jobs/sync_job_ready_ui.py."
+)
+EXIT_RETIRED = 2
 SLOW_SOURCES = {"naukri", "linkedin", "foundit"}
 _slow_lock = threading.Lock()
 _slow_next = 0.0
@@ -186,54 +199,6 @@ def apply_updates(results: list[tuple[str, str, str, str]]) -> None:
         raise last_err
 
 
-def sync_dead_to_job_ready(results: list[tuple[str, str, str, str]], *, confirm_target: str) -> dict[str, int]:
-    """Mark confirmed-expired catalog rows expired. Rows are retained.
-
-    Unknown and generic link failures are ignored. The application database
-    is unchanged unless confirm_target matches it. Confirmation is checked
-    before either write.
-    """
-    from sync_job_ready_ui import archive_ui_jobs_not_in_catalog, assert_application_write_target
-
-    dead_ids = sorted(
-        {
-            job_id
-            for _row_id, job_id, _source, status in results
-            if job_id and status == LINK_STATUS_EXPIRED
-        }
-    )
-    if not dead_ids:
-        print("  job-ready sync: no confirmed-expired ids in this batch", flush=True)
-        return {"removed": 0, "dead_ids": 0, "expired": 0}
-    assert_application_write_target(confirm_target)
-    catalog = (os.getenv("JOB_READY_DATABASE_URL") or "").strip()
-    try:
-        with psycopg2.connect(catalog, connect_timeout=20) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE validated_jobs
-                    SET link_status = 'expired', updated_at = NOW()
-                    WHERE job_id = ANY(%s)
-                      AND link_status IS DISTINCT FROM 'expired'
-                    """,
-                    (dead_ids,),
-                )
-                removed = int(cur.rowcount)
-            conn.commit()
-    except SystemExit:
-        raise
-    except Exception:
-        print("  job-ready sync failed", flush=True)
-        raise SystemExit("UI_SYNC_FAILED") from None
-    print(f"  job-ready sync: marked {removed} expired of {len(dead_ids)} confirmed", flush=True)
-    ui = {"archived": 0, "reactivated": 0}
-    if removed:
-        ui = archive_ui_jobs_not_in_catalog(confirm_target=confirm_target)
-        print(f"  job-ready UI sync archived={ui.get('archived', 0)} reactivated={ui.get('reactivated', 0)}", flush=True)
-    return {"removed": removed, "dead_ids": len(dead_ids), "archived": int(ui.get("archived", 0))}
-
-
 def status_summary() -> dict[str, Any]:
     with connect() as conn:
         with conn.cursor() as cur:
@@ -304,25 +269,21 @@ def main() -> None:
     )
     p.add_argument(
         "--sync-job-ready-every",
-        type=int,
-        default=0,
-        help="Every N checks, remove newly dead catalog rows and align the application DB. 0 leaves JobReady unchanged.",
+        default=None,
+        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; JobReady is never modified by this command.",
     )
     p.add_argument(
         "--confirm-target",
-        default="",
-        help="Application database as host:port/database. Required with --sync-job-ready-every. Not a DSN.",
+        default=None,
+        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; JobReady is never modified by this command.",
     )
     args = p.parse_args()
+    if args.sync_job_ready_every is not None or args.confirm_target is not None:
+        print(JOBREADY_SYNC_RETIRED, flush=True)
+        print(JOBREADY_SYNC_RETIRED_HELP, flush=True)
+        raise SystemExit(EXIT_RETIRED)
     load_env(args.env_file)
-    sync_every = max(0, int(args.sync_job_ready_every or 0))
-    if sync_every:
-        from sync_job_ready_ui import assert_application_write_target
-
-        print(f"TARGET {assert_application_write_target(args.confirm_target)}", flush=True)
-        print(f"Job-ready application sync every {sync_every} checks", flush=True)
-    else:
-        print("Job-ready application database will not be modified", flush=True)
+    print("JobReady catalog and application database will not be modified", flush=True)
     source_filter = [s.strip().lower() for s in args.sources.split(",") if s.strip()] or None
 
     rows = fetch_jobs(
@@ -370,8 +331,6 @@ def main() -> None:
     by_source_delta: dict[str, dict[str, int]] = {}
     t0 = time.time()
     pending: list[tuple[str, str, str, str]] = []
-    sync_pending: list[tuple[str, str, str, str]] = []
-    last_job_ready_sync_at = 0
     run_error: str | None = None
     run_status = "success"
 
@@ -383,8 +342,6 @@ def main() -> None:
             for fut in as_completed(futures):
                 row_id, job_id, source, status = fut.result()
                 pending.append((row_id, job_id, source, status))
-                if sync_every:
-                    sync_pending.append((row_id, job_id, source, status))
                 counts["checked"] += 1
                 counts[status] = counts.get(status, 0) + 1
                 by_source_delta.setdefault(source or "unknown", {})
@@ -405,19 +362,9 @@ def main() -> None:
                         f"({rate:.1f}/s)",
                         flush=True,
                     )
-                if sync_every and counts["checked"] - last_job_ready_sync_at >= sync_every:
-                    if pending:
-                        apply_updates(pending)
-                        pending.clear()
-                    sync_dead_to_job_ready(sync_pending, confirm_target=args.confirm_target)
-                    sync_pending.clear()
-                    last_job_ready_sync_at = counts["checked"]
 
         if pending:
             apply_updates(pending)
-        if sync_every and sync_pending:
-            sync_dead_to_job_ready(sync_pending, confirm_target=args.confirm_target)
-            sync_pending.clear()
     except Exception as exc:
         run_status = "failed"
         run_error = type(exc).__name__
