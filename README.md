@@ -110,3 +110,5 @@ Naukri, Indeed, LinkedIn, Google, and Foundit, for the role families in `naukri_
 The modules in [LEGACY.md](LEGACY.md) still talk to CodeQuest or the old `naukri_scraper` database. Do not use them for the daily catalog. `link_validator_service/run_scheduled.py` only delegates to the command above.
 
 `codequest_jobs/prune_job_ready_now.py` is retired. It exits with `RETIRED_COMMAND prune_job_ready_now` and touches no database. CodeQuest does not decide which catalog jobs survive.
+
+`codequest_jobs/audit_job_ready.py` is a read-only catalog audit. Neither it nor `codequest_jobs/validate_links.py` writes JobReady lifecycle state; their old write options (`--prune-job-ready`, `--sync-job-ready-every`, `--confirm-target`) exit with `JOBREADY_SYNC_RETIRED`. Only the daily command changes `link_status`.

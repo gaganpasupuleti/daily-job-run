@@ -8,10 +8,12 @@ audit observed (observation: confirmed_active, confirmed_expired, or
 inconclusive). An inconclusive check never counts as confirmed_active,
 whatever the stored status was.
 
-By default this only reads the catalog and checks URLs. It does not modify the
-catalog or the JobReady application database. Pass --prune-job-ready and
---confirm-target to mark confirmed_expired catalog rows expired (rows are kept)
-and align application jobs.
+This command is read-only. It reads the catalog in a read-only session,
+checks URLs, and writes only its local JSON report. It never changes link_status, writes lifecycle evidence, applies
+schema, or touches the JobReady application database. Catalog lifecycle changes
+come from run_jobready_daily.py. The retired --prune-job-ready and
+--confirm-target options are refused with JOBREADY_SYNC_RETIRED and exit code 2
+before any environment or database access.
 """
 
 from __future__ import annotations
@@ -34,11 +36,16 @@ if str(ROOT) not in sys.path:
 
 from db import load_env
 from jobready_validator import Probe, default_probes, validate_candidates
-from link_checker import LINK_STATUS_EXPIRED
 from link_policy import CONFIRMED_ACTIVE, CONFIRMED_EXPIRED, INCONCLUSIVE
-from validate_links import sync_dead_to_job_ready
 
 ENV = ROOT.parent / "naukri_jobs_scraper" / ".env"
+JOBREADY_SYNC_RETIRED = "JOBREADY_SYNC_RETIRED"
+JOBREADY_SYNC_RETIRED_HELP = (
+    "audit_job_ready.py is read-only and no longer writes the JobReady catalog or application database.\n"
+    "Catalog lifecycle changes come from codequest_jobs/run_jobready_daily.py.\n"
+    "Application membership reconciliation is codequest_jobs/sync_job_ready_ui.py."
+)
+EXIT_RETIRED = 2
 SOURCE_ORDER = {"linkedin": 0, "indeed": 1, "foundit": 2, "naukri": 3}
 CONCLUSIVE = (CONFIRMED_ACTIVE, CONFIRMED_EXPIRED)
 ROW_COLUMNS = ("job_id", "source", "job_url", "apply_url", "link_status")
@@ -114,25 +121,24 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Read-only catalog link audit unless prune is explicit")
+    parser = argparse.ArgumentParser(description="Read-only catalog link audit")
     parser.add_argument(
         "--prune-job-ready",
         action="store_true",
-        help="Mark confirmed_expired catalog rows expired (rows are kept) and align application jobs",
+        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; this audit never modifies JobReady.",
     )
     parser.add_argument(
         "--confirm-target",
-        default="",
-        help="Application database as host:port/database. Required with --prune-job-ready. Not a DSN.",
+        default=None,
+        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; this audit never modifies JobReady.",
     )
     args = parser.parse_args(argv)
+    if args.prune_job_ready or args.confirm_target is not None:
+        print(JOBREADY_SYNC_RETIRED, flush=True)
+        print(JOBREADY_SYNC_RETIRED_HELP, flush=True)
+        return EXIT_RETIRED
     load_env(ENV)
-    if args.prune_job_ready:
-        from sync_job_ready_ui import assert_application_write_target
-
-        print(f"TARGET {assert_application_write_target(args.confirm_target)}", flush=True)
-    else:
-        print("Read-only audit. The application database will not be modified.", flush=True)
+    print("Read-only audit. The JobReady catalog and application database will not be modified.", flush=True)
 
     rows = fetch_job_ready_rows()
     by_source: dict[str, int] = {}
@@ -146,30 +152,14 @@ def main(argv: list[str] | None = None) -> int:
 
     probes = default_probes()
     results: list[dict[str, Any]] = []
-    pending: list[dict[str, Any]] = []
-    removed = 0
     t0 = time.time()
-
-    def flush(batch: list[dict[str, Any]]) -> int:
-        dead = [
-            (result["job_id"], result["job_id"], result["source"], LINK_STATUS_EXPIRED)
-            for result in batch
-            if result["observation"] == CONFIRMED_EXPIRED
-        ]
-        if not dead or not args.prune_job_ready:
-            return 0
-        outcome = sync_dead_to_job_ready(dead, confirm_target=args.confirm_target)
-        return int(outcome.get("removed") or 0)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(audit_row, row, probes) for row in rows]
         for fut in as_completed(futures):
             result = fut.result()
             results.append(result)
-            pending.append(result)
-            if len(pending) >= 100:
-                removed += flush(pending)
-                pending.clear()
+            if len(results) % 100 == 0:
                 counts = summarize(results)
                 elapsed = time.time() - t0
                 rate = counts["checked"] / elapsed if elapsed else 0
@@ -179,20 +169,17 @@ def main(argv: list[str] | None = None) -> int:
                     f"confirmed_active={counts[CONFIRMED_ACTIVE]} "
                     f"confirmed_expired={counts[CONFIRMED_EXPIRED]} "
                     f"inconclusive={counts[INCONCLUSIVE]} "
-                    f"removed={removed} ({rate:.1f}/s, ~{left/60:.0f}m left)",
+                    f"({rate:.1f}/s, ~{left/60:.0f}m left)",
                     flush=True,
                 )
 
-    removed += flush(pending)
     elapsed = round(time.time() - t0, 1)
     results.sort(key=lambda result: result["job_id"])
     summary = {
         **summarize(results),
         "queued": len(rows),
-        "removed": removed,
         "elapsed_sec": elapsed,
         "by_source_queued": by_source,
-        "prune": args.prune_job_ready,
     }
     report = {**summary, "results": results}
     out = ROOT / "output" / f"job_ready_audit_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"

@@ -258,17 +258,16 @@ class ReadOnlyAuditTests(unittest.TestCase):
         self.assertFalse(fake.committed)
         self.assertTrue(fake.closed)
 
-    def run_audit(self, argv: list[str], rows: list[dict], probe) -> tuple[dict, list, str]:
-        synced: list = []
+    def run_audit(self, argv: list[str], rows: list[dict], probe) -> tuple[dict, str]:
         stdout = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(audit_job_ready, "ROOT", Path(tmp)), mock.patch.object(
             audit_job_ready, "load_env"
         ), mock.patch.object(audit_job_ready, "fetch_job_ready_rows", return_value=rows), mock.patch.object(
             audit_job_ready, "default_probes", return_value={"naukri": probe, "linkedin": probe}
         ), mock.patch.object(
-            audit_job_ready, "sync_dead_to_job_ready", side_effect=lambda batch, **kw: synced.append(batch) or {"removed": len(batch)}
+            sync_job_ready_ui, "assert_application_write_target", side_effect=AssertionError("no application target expected")
         ), mock.patch.object(
-            sync_job_ready_ui, "assert_application_write_target", return_value="app.invalid:5432/railway"
+            sync_job_ready_ui, "archive_ui_jobs_not_in_catalog", side_effect=AssertionError("no membership write expected")
         ), mock.patch.object(
             audit_job_ready.psycopg2, "connect", side_effect=AssertionError("no database connection expected")
         ), redirect_stdout(stdout):
@@ -276,13 +275,13 @@ class ReadOnlyAuditTests(unittest.TestCase):
             self.assertEqual(code, 0)
             report_path = next((Path(tmp) / "output").glob("job_ready_audit_*.json"))
             report = json.loads(report_path.read_text(encoding="utf-8"))
-        return report, synced, stdout.getvalue()
+        return report, stdout.getvalue()
 
     def stored_rows(self) -> list[dict]:
         return [dict(zip(audit_job_ready.ROW_COLUMNS, raw)) for raw in self.STORED]
 
     def test_inconclusive_rows_are_never_reported_as_confirmed_active(self) -> None:
-        report, synced, output = self.run_audit([], self.stored_rows(), linkedin_probe(status_code=429))
+        report, output = self.run_audit([], self.stored_rows(), linkedin_probe(status_code=429))
         self.assertEqual(report["confirmed_active"], 0)
         self.assertEqual(report["inconclusive"], 3)
         self.assertEqual((report["persisted_active"], report["persisted_expired"], report["persisted_other"]), (1, 1, 1))
@@ -294,37 +293,39 @@ class ReadOnlyAuditTests(unittest.TestCase):
         self.assertEqual(
             set(report["results"][0]), {"job_id", "source", "persisted_status", "observation", "reason", "provider"}
         )
-        self.assertEqual(synced, [])
         self.assertIn("will not be modified", output)
         self.assertIn('"confirmed_active": 0', output)
 
     def test_read_only_audit_does_not_write_confirmed_results(self) -> None:
         closed = naukri_probe(payload={"job": {"jobId": NAUKRI_ID, "jobStatus": "expired"}})
-        report, synced, _output = self.run_audit([], self.stored_rows(), closed)
+        report, _output = self.run_audit([], self.stored_rows(), closed)
         self.assertEqual(report["confirmed_expired"], 3)
-        self.assertEqual(report["removed"], 0)
-        self.assertEqual(synced, [])
+        self.assertNotIn("removed", report)
+        self.assertNotIn("prune", report)
 
     def test_expired_row_confirmed_open_is_reported_but_not_reactivated(self) -> None:
         opened = naukri_probe(payload={"job": {"jobId": NAUKRI_ID, "jobStatus": "active"}})
-        report, synced, _output = self.run_audit([], self.stored_rows(), opened)
+        report, _output = self.run_audit([], self.stored_rows(), opened)
         expired_row = next(item for item in report["results"] if item["job_id"] == "CQJ-E")
         self.assertEqual((expired_row["persisted_status"], expired_row["observation"]), ("expired", "confirmed_active"))
         self.assertEqual(report["persisted_by_observation"]["expired"], {"confirmed_active": 1})
-        self.assertEqual(synced, [])
 
-    def test_explicit_prune_passes_only_confirmed_expired_rows(self) -> None:
-        def mixed(item):
-            if item["job_id"] == "CQJ-A":
-                return naukri_probe(payload={"job": {"jobId": NAUKRI_ID, "jobStatus": "expired"}})(item)
-            return linkedin_probe(status_code=503)(item)
-
-        report, synced, _output = self.run_audit(
-            ["--prune-job-ready", "--confirm-target", "app.invalid:5432/railway"], self.stored_rows(), mixed
-        )
-        self.assertEqual(synced, [[("CQJ-A", "CQJ-A", "naukri", "expired")]])
-        self.assertEqual(report["removed"], 1)
-        self.assertEqual((report["confirmed_expired"], report["inconclusive"]), (1, 2))
+    def test_retired_prune_option_is_refused_before_reading_the_catalog(self) -> None:
+        for argv in (
+            ["--prune-job-ready", "--confirm-target", "app.invalid:5432/railway"],
+            ["--prune-job-ready"],
+            ["--confirm-target", "app.invalid:5432/railway"],
+        ):
+            stdout = io.StringIO()
+            with mock.patch.object(audit_job_ready, "load_env", side_effect=AssertionError("load_env")), mock.patch.object(
+                audit_job_ready, "fetch_job_ready_rows", side_effect=AssertionError("catalog read")
+            ), mock.patch.object(
+                audit_job_ready, "default_probes", side_effect=AssertionError("network probes")
+            ), redirect_stdout(stdout):
+                code = audit_job_ready.main(argv)
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(stdout.getvalue().splitlines()[0], "JOBREADY_SYNC_RETIRED", argv)
+            self.assertNotIn("app.invalid", stdout.getvalue(), argv)
 
 
 if __name__ == "__main__":
