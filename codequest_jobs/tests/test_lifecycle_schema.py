@@ -57,6 +57,8 @@ EXPECTED_COLUMNS = {
     "final_url": ("text", "YES"),
     "http_status": ("integer", "YES"),
     "evidence_version": ("text", "NO"),
+    "expected_identity": ("text", "YES"),
+    "observed_identities": ("ARRAY", "YES"),
 }
 EXPECTED_INDEXDEFS = {
     "idx_jobready_link_observations_job_time": (

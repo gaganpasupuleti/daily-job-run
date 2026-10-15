@@ -59,6 +59,33 @@ def indeed_jk_from_url(url: str) -> str | None:
     return None
 
 
+def _job_data_results(payload: object) -> list | None:
+    """The jobData results list of a GraphQL response, or None when the response has none."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    job_data = data.get("jobData") if isinstance(data, dict) else None
+    results = job_data.get("results") if isinstance(job_data, dict) else None
+    return results if isinstance(results, list) else None
+
+
+def indeed_returned_keys(payload: object) -> list[object] | None:
+    """Every job key the response returned, requested or not, as returned.
+
+    None when the response has no results list. Keys are evidence of what Indeed
+    answered, not lifecycle evidence; parse_indeed_results decides the flag.
+    """
+    results = _job_data_results(payload)
+    if results is None:
+        return None
+    keys: list[object] = []
+    for item in results:
+        job = item.get("job") if isinstance(item, dict) else None
+        if isinstance(job, dict) and job.get("key") is not None:
+            keys.append(job["key"])
+    return keys
+
+
 def parse_indeed_results(payload: object, requested: list[str]) -> dict[str, bool | None]:
     """Map each requested jk to the API's boolean expired flag, else None.
 
@@ -66,12 +93,8 @@ def parse_indeed_results(payload: object, requested: list[str]) -> dict[str, boo
     requested are ignored. A key returned twice with different flags is unknown.
     """
     out: dict[str, bool | None] = {jk: None for jk in requested}
-    if not isinstance(payload, dict):
-        return out
-    data = payload.get("data")
-    job_data = data.get("jobData") if isinstance(data, dict) else None
-    results = job_data.get("results") if isinstance(job_data, dict) else None
-    if not isinstance(results, list):
+    results = _job_data_results(payload)
+    if results is None:
         return out
     seen: dict[str, bool | None] = {}
     for item in results:
@@ -104,28 +127,51 @@ def batch_indeed_expired(jks: list[str]) -> dict[str, bool | None]:
     with httpx.Client(timeout=15.0) as client:
         for i in range(0, len(unique), BATCH_SIZE):
             chunk = unique[i : i + BATCH_SIZE]
-            query = (
-                "query { jobData(jobKeys: "
-                + json.dumps(chunk)
-                + ") { results { job { key expired } } } }"
-            )
-            try:
-                resp = client.post(
-                    INDEED_GRAPHQL,
-                    headers=indeed_headers(),
-                    json={"query": query},
-                )
-                if resp.status_code != 200:
-                    logger.warning("Indeed GraphQL HTTP %s", resp.status_code)
-                    for jk in chunk:
-                        out.setdefault(jk, None)
-                    continue
-                out.update(parse_indeed_results(resp.json(), chunk))
-            except Exception as exc:
-                logger.warning("Indeed GraphQL batch failed: %s", exc)
+            payload = _post_job_data(client, chunk)
+            if payload is None:
                 for jk in chunk:
                     out.setdefault(jk, None)
+                continue
+            out.update(parse_indeed_results(payload, chunk))
     return out
+
+
+def _post_job_data(client: httpx.Client, chunk: list[str]) -> object | None:
+    """POST one jobData query. The decoded payload, or None on an HTTP or transport failure."""
+    query = (
+        "query { jobData(jobKeys: "
+        + json.dumps(chunk)
+        + ") { results { job { key expired } } } }"
+    )
+    try:
+        resp = client.post(
+            INDEED_GRAPHQL,
+            headers=indeed_headers(),
+            json={"query": query},
+        )
+        if resp.status_code != 200:
+            logger.warning("Indeed GraphQL HTTP %s", resp.status_code)
+            return None
+        return resp.json()
+    except Exception as exc:
+        logger.warning("Indeed GraphQL batch failed: %s", exc)
+        return None
+
+
+def lookup_indeed_job(jk: str) -> tuple[bool | None, list[object] | None]:
+    """One job key: (the strict expired flag, every key the response returned).
+
+    The flag follows parse_indeed_results. The keys are None when no API key is
+    configured or no usable response came back; otherwise indeed_returned_keys.
+    """
+    if not (os.getenv("INDEED_API_KEY") or "").strip():
+        logger.warning("INDEED_API_KEY is not configured")
+        return None, None
+    with httpx.Client(timeout=15.0) as client:
+        payload = _post_job_data(client, [jk])
+    if payload is None:
+        return None, None
+    return parse_indeed_results(payload, [jk])[jk], indeed_returned_keys(payload)
 
 
 def check_indeed_via_api(jk: str) -> str | None:
