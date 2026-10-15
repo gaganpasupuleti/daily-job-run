@@ -408,7 +408,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_VALIDATION_LIMIT,
         help=f"Catalog rows to validate on a normal run (default {DEFAULT_VALIDATION_LIMIT}).",
     )
-    parser.add_argument("--full-audit", action="store_true", help="Validate every catalog row.")
+    parser.add_argument("--full-audit", action="store_true", help="Validate every catalog row on a supported lifecycle source.")
     return parser.parse_args(argv)
 
 

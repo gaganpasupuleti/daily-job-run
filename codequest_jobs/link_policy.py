@@ -7,6 +7,7 @@ Unknown, timeouts, blocks, and generic link failures keep the previous state.
 from __future__ import annotations
 
 import re
+import string
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -21,11 +22,18 @@ UNSUPPORTED = "unsupported"
 UNSUPPORTED_SOURCE = "unsupported_source"
 # Sources with a provider lifecycle probe in jobready_validator.default_probes().
 SUPPORTED_LIFECYCLE_SOURCES = frozenset({"indeed", "linkedin", "naukri"})
+# Characters stripped from both ends of a source: ASCII space, \t, \n, \v, \f, \r.
+SOURCE_TRIM_CHARS = " \t\n\x0b\x0c\r"
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _SOURCE_LABEL_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
 
 
 def normalize_source(source: Any) -> str:
-    return source.strip().lower() if isinstance(source, str) else ""
+    """Strip SOURCE_TRIM_CHARS and lowercase ASCII A-Z only.
+
+    jobready_catalog.SUPPORTED_SOURCE_SQL applies the same rule in PostgreSQL; the two must agree.
+    """
+    return source.strip(SOURCE_TRIM_CHARS).translate(_ASCII_LOWER) if isinstance(source, str) else ""
 
 
 def lifecycle_capability(source: Any) -> str:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import string
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -18,6 +19,7 @@ import psycopg2
 from psycopg2.extras import Json, execute_values
 
 from link_policy import (
+    SOURCE_TRIM_CHARS,
     SUPPORTED,
     SUPPORTED_LIFECYCLE_SOURCES,
     lifecycle_capability,
@@ -215,8 +217,12 @@ INJECTED_EVIDENCE_VERSION = "jobready-injected-v1"
 
 # A normal daily run checks this many catalog rows, oldest first after the priority share.
 DEFAULT_VALIDATION_LIMIT = 200
-# Bound to sorted(SUPPORTED_LIFECYCLE_SOURCES); matches link_policy.normalize_source.
-SUPPORTED_SOURCE_SQL = "lower(btrim(source)) = ANY(%s)"
+# link_policy.normalize_source in PostgreSQL: trim SOURCE_TRIM_CHARS, lowercase ASCII A-Z only.
+# Built from constants, never from catalog data. Bound to sorted(SUPPORTED_LIFECYCLE_SOURCES).
+_SOURCE_TRIM_SQL = " || ".join(f"chr({ord(char)})" for char in SOURCE_TRIM_CHARS)
+SUPPORTED_SOURCE_SQL = (
+    f"translate(btrim(source, {_SOURCE_TRIM_SQL}), '{string.ascii_uppercase}', '{string.ascii_lowercase}') = ANY(%s)"
+)
 
 PRESERVE_WHEN_BLANK = {
     "company",

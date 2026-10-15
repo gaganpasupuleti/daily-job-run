@@ -43,6 +43,7 @@ from link_policy import (
     INCONCLUSIVE,
     UNSUPPORTED,
     UNSUPPORTED_SOURCE,
+    normalize_source,
     source_label,
 )
 
@@ -82,7 +83,7 @@ def fetch_job_ready_rows() -> list[dict[str, Any]]:
             rows = [dict(zip(ROW_COLUMNS, raw)) for raw in cur.fetchall()]
     finally:
         conn.close()
-    rows.sort(key=lambda row: (SOURCE_ORDER.get((row["source"] or "").lower(), 9), row["job_id"]))
+    rows.sort(key=lambda row: (SOURCE_ORDER.get(normalize_source(row["source"]), 9), row["job_id"]))
     return rows
 
 
@@ -166,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = fetch_job_ready_rows()
     by_source: dict[str, int] = {}
     for row in rows:
-        key = (row["source"] or "unknown").lower()
+        key = source_label(row["source"])
         by_source[key] = by_source.get(key, 0) + 1
     print(f"Job-ready availability audit: {len(rows)} links", flush=True)
     print("by_source:", by_source, flush=True)

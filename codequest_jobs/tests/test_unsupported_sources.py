@@ -32,6 +32,7 @@ import jobready_catalog as catalog  # noqa: E402
 import jobready_validator as validator  # noqa: E402
 import run_jobready_daily as daily  # noqa: E402
 from link_policy import (  # noqa: E402
+    SOURCE_TRIM_CHARS,
     SUPPORTED,
     SUPPORTED_LIFECYCLE_SOURCES,
     UNSUPPORTED,
@@ -43,6 +44,39 @@ CATALOG_URL = os.environ.get("JOBREADY_DAILY_CATALOG_URL", "").strip()
 SUPPORTED_CASES = ("linkedin", "LinkedIn", "  LINKEDIN ", "naukri", "Naukri", "indeed", "INDEED")
 UNSUPPORTED_CASES = ("google", "Google", "foundit", "unknown", "generic", "", "   ", None, 7, "future-board", "linkedin.com")
 T0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+HOSTILE_SOURCE = "https://user:SECRET@example.invalid/path?token=SENTINEL"
+LEAK_MARKERS = ("SECRET", "SENTINEL", "example.invalid", "://", "@", HOSTILE_SOURCE)
+# Every supported label with surrounding ASCII whitespace and mixed case.
+SUPPORTED_VARIANTS = tuple(
+    variant
+    for name in ("LinkedIn", "Naukri", "Indeed")
+    for variant in (name.lower(), name.upper(), f" {name} ", f"\t{name}", f"{name}\n", f"\r{name}\t", f"\f{name}\v")
+)
+MALFORMED_SOURCES = (
+    "",
+    "   ",
+    "google",
+    "foundit",
+    "linkedin.com",
+    "linked-in",
+    " linkedin . ",
+    "https://linkedin.com/jobs/123",
+    HOSTILE_SOURCE,
+    "\u00a0linkedin",
+    "lin\u212aedin",
+    "indeed-jobs",
+    "naukri.example",
+)
+MALFORMED_LABELS = {
+    "foundit": 1,
+    "google": 1,
+    "indeed-jobs": 1,
+    "linked-in": 1,
+    "linkedin.com": 1,
+    "naukri.example": 1,
+    "other": 5,
+    "unknown": 2,
+}
 
 
 def _row(job_id: str, source, url: str = "https://jobs.example.test/1") -> dict:
@@ -90,6 +124,23 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(source_label("future-board"), "future-board")
         self.assertEqual(source_label("https://evil.example/?token=secret"), "other")
         self.assertEqual(source_label("x" * 33), "other")
+
+
+class NormalizationContractTests(unittest.TestCase):
+    def test_only_surrounding_ascii_whitespace_and_case_are_normalized(self) -> None:
+        self.assertEqual(SOURCE_TRIM_CHARS, " \t\n\x0b\x0c\r")
+        for source in SUPPORTED_VARIANTS:
+            self.assertEqual(lifecycle_capability(source), SUPPORTED, repr(source))
+            self.assertIsNotNone(validator.probe_for(source), repr(source))
+            self.assertIn(source_label(source), SUPPORTED_LIFECYCLE_SOURCES, repr(source))
+        for source in MALFORMED_SOURCES + (None,):
+            self.assertEqual(lifecycle_capability(source), UNSUPPORTED, repr(source))
+            self.assertIsNone(validator.probe_for(source), repr(source))
+
+    def test_sql_selection_trims_the_python_trim_set(self) -> None:
+        for char in SOURCE_TRIM_CHARS:
+            self.assertIn(f"chr({ord(char)})", catalog.SUPPORTED_SOURCE_SQL)
+        self.assertNotIn("lower(", catalog.SUPPORTED_SOURCE_SQL)
 
 
 class ValidatorDispatchTests(unittest.TestCase):
@@ -203,6 +254,44 @@ class AuditUnsupportedTests(unittest.TestCase):
         self.assertEqual(report["unsupported_by_source"], {"foundit": 1, "google": 1, "unknown": 1})
         self.assertEqual(report["validation_reasons"]["unsupported:unsupported_source"], 3)
         self.assertEqual(report["queued"], report["checked"] + report["unsupported"])
+
+    def test_hostile_source_never_reaches_audit_output(self) -> None:
+        rows = [_row("S1", "linkedin"), _row("S2", "\tLinkedIn\n"), _row("U1", "google")]
+        rows += [_row(f"H{index:03d}", HOSTILE_SOURCE) for index in range(117)]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            network = _Network(stack)
+            stack.enter_context(mock.patch.object(audit_job_ready, "ROOT", Path(tmp)))
+            stack.enter_context(mock.patch.object(audit_job_ready, "load_env"))
+            stack.enter_context(mock.patch.object(audit_job_ready, "fetch_job_ready_rows", return_value=rows))
+            stack.enter_context(
+                mock.patch.object(
+                    audit_job_ready,
+                    "default_probes",
+                    return_value={"linkedin": lambda row: ("confirmed_active", "fixture_open", "linkedin")},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(audit_job_ready.psycopg2, "connect", side_effect=AssertionError("no database access"))
+            )
+            stack.enter_context(redirect_stdout(stdout))
+            stack.enter_context(mock.patch.object(sys, "stderr", stderr))
+            code = audit_job_ready.main([])
+            report_text = next((Path(tmp) / "output").glob("job_ready_audit_*.json")).read_text(encoding="utf-8")
+        with self.assertRaises(validator.UnsupportedSourceError) as caught:
+            validator.validate_candidates([_row("H1", HOSTILE_SOURCE)])
+        report = json.loads(report_text)
+        self.assertEqual(code, 0)
+        self.assertEqual(network.attempts, [])
+        self.assertIn("progress 100/120", stdout.getvalue())
+        self.assertEqual(report["by_source_queued"], {"google": 1, "linkedin": 2, "other": 117})
+        self.assertEqual(report["unsupported_by_source"], {"google": 1, "other": 117})
+        self.assertEqual({result["source"] for result in report["results"]}, {"google", "linkedin", "other"})
+        self.assertEqual(caught.exception.sources, ["other"])
+        error_text = f"{caught.exception!s} {caught.exception!r} {caught.exception.sources!r}"
+        for name, text in (("stdout", stdout.getvalue()), ("stderr", stderr.getvalue()), ("report", report_text), ("error", error_text)):
+            for marker in LEAK_MARKERS:
+                self.assertNotIn(marker.lower(), text.lower(), f"{name} leaked a source fragment")
 
 
 class _CatalogFixture(unittest.TestCase):
@@ -341,6 +430,37 @@ class CatalogSelectionTests(_CatalogFixture):
 
 
 @unittest.skipUnless(CATALOG_URL, "disposable daily catalog is not configured")
+class NormalizationParityTests(_CatalogFixture):
+    def _seed_matrix(self) -> tuple[list[str], list[str]]:
+        sources = {self._seed(source, 1)[0]: source for source in SUPPORTED_VARIANTS + MALFORMED_SOURCES}
+        supported = sorted(job_id for job_id, source in sources.items() if lifecycle_capability(source) == SUPPORTED)
+        unsupported = sorted(set(sources) - set(supported))
+        self.assertEqual(len(supported), len(SUPPORTED_VARIANTS))
+        return supported, unsupported
+
+    def test_python_and_postgres_agree_on_every_selection_path(self) -> None:
+        supported, unsupported = self._seed_matrix()
+        everything = supported + unsupported
+        self.assertEqual(sorted(self._select(limit=1000, priority_ids=[])), supported)
+        self.assertEqual(sorted(self._select(limit=1, full_audit=True)), supported)
+        self.assertEqual(sorted(self._select(limit=2 * len(everything), priority_ids=everything)), supported)
+        self.assertEqual(self._select(limit=1000, priority_ids=unsupported), self._select(limit=1000, priority_ids=[]))
+        fill = self._select(limit=len(supported), priority_ids=supported[-2:] + unsupported)
+        self.assertEqual(fill[:2], supported[-2:])
+        self.assertEqual(sorted(fill), supported)
+
+    def test_capability_counts_match_postgres_selection(self) -> None:
+        supported, unsupported = self._seed_matrix()
+        counts = catalog.catalog_counts(self.conn)
+        self.conn.rollback()
+        self.assertEqual(counts["supported"], len(self._select(limit=1, full_audit=True)))
+        self.assertEqual((counts["supported"], counts["unsupported"]), (len(supported), len(unsupported)))
+        self.assertEqual(counts["supported"] + counts["unsupported"], counts["total"])
+        self.assertEqual(counts["unsupported_by_source"], MALFORMED_LABELS)
+        self.assertEqual(sum(counts["unsupported_by_source"].values()), counts["unsupported"])
+
+
+@unittest.skipUnless(CATALOG_URL, "disposable daily catalog is not configured")
 class DailyUnsupportedTests(_CatalogFixture):
     def _run(self, *, probes, **kwargs) -> tuple[dict, list[str]]:
         probed: list[str] = []
@@ -431,6 +551,25 @@ class DailyUnsupportedTests(_CatalogFixture):
             self.assertEqual(report["validation_reasons"], {})
             self.assertEqual(report["catalog_unsupported_rows"], 5)
             self._assert_untouched(before, unsupported)
+
+    def test_whitespace_variant_of_a_supported_source_is_validated(self) -> None:
+        unsupported = self._seed("\tGoogle\n", 1) + self._seed(" linkedin . ", 1)
+        variants = self._seed("\tLinkedIn\n", 1) + self._seed("\fNAUKRI\v", 1)
+        before = self._states(unsupported)
+        report, probed = self._run(
+            probes={
+                "linkedin": lambda row: ("confirmed_active", "fixture_open", "linkedin"),
+                "naukri": lambda row: ("confirmed_active", "fixture_open", "naukri"),
+            },
+            validation_limit=10,
+        )
+        self.assertEqual(sorted(probed), sorted(variants))
+        self.assertEqual((report["validation_selected"], report["confirmed_active"]), (2, 2))
+        self.assertEqual((report["catalog_supported_rows"], report["catalog_unsupported_rows"]), (2, 2))
+        self.assertEqual(report["catalog_unsupported_by_source"], {"google": 1, "other": 1})
+        ledger_ids = {row[0] for row in self._fetch("SELECT job_id FROM jobready_link_observations")}
+        self.assertEqual(ledger_ids, set(variants))
+        self._assert_untouched(before, unsupported)
 
     def test_unsupported_rows_never_gain_confirmed_evidence(self) -> None:
         unchecked = self._seed("google", 2, checked=False) + self._seed("foundit", 1, checked=False)
