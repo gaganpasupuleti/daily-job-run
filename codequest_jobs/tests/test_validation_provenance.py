@@ -205,7 +205,7 @@ class ObservationCompatibilityTests(unittest.TestCase):
         item = LinkObservation("CQJ-1", "active", "confirmed_active", "naukri", "naukri_explicit_open")
         self.assertEqual(_provenance(item), (None, None, None))
         self.assertEqual(item.evidence_version, JOBREADY_EVIDENCE_VERSION)
-        self.assertEqual(JOBREADY_EVIDENCE_VERSION, "jobready-validator-v1")
+        self.assertEqual(JOBREADY_EVIDENCE_VERSION, "jobready-validator-v2")
 
     def test_legacy_probe_tuple_carries_no_provenance(self) -> None:
         rows = [{"job_id": "CQJ-a", "source": "naukri", "job_url": "https://example.test/a", "link_status": "active"}]
@@ -378,7 +378,7 @@ class NaukriProvenanceTests(unittest.TestCase):
 
 class IndeedProvenanceTests(unittest.TestCase):
     def test_missing_key_makes_no_request(self) -> None:
-        with patch.dict(os.environ, {"INDEED_API_KEY": ""}), patch.object(indeed_checker, "check_indeed_via_api") as check:
+        with patch.dict(os.environ, {"INDEED_API_KEY": ""}), patch.object(indeed_checker, "lookup_indeed_job") as check:
             result = probe_indeed(INDEED_ROW)
         check.assert_not_called()
         self.assertEqual((result.observation, result.reason), ("inconclusive", "indeed_missing_api_key"))
@@ -386,7 +386,7 @@ class IndeedProvenanceTests(unittest.TestCase):
 
     def test_missing_job_key_makes_no_request(self) -> None:
         with patch.dict(os.environ, {"INDEED_API_KEY": "fixture-not-a-key"}), patch.object(
-            indeed_checker, "check_indeed_via_api"
+            indeed_checker, "lookup_indeed_job"
         ) as check:
             result = probe_indeed(dict(INDEED_ROW, job_url="https://in.indeed.com/viewjob"))
         check.assert_not_called()
@@ -395,12 +395,12 @@ class IndeedProvenanceTests(unittest.TestCase):
 
     def test_api_request_records_only_the_endpoint(self) -> None:
         for helper_result, expected in (
-            ("active", ("confirmed_active", "indeed_expired_false")),
-            ("expired", ("confirmed_expired", "indeed_expired_true")),
-            (None, ("inconclusive", "indeed_api_error")),
+            ((False, ["0123456789abcdef"]), ("confirmed_active", "indeed_expired_false")),
+            ((True, ["0123456789abcdef"]), ("confirmed_expired", "indeed_expired_true")),
+            ((None, None), ("inconclusive", "indeed_api_error")),
         ):
             with patch.dict(os.environ, {"INDEED_API_KEY": "fixture-not-a-key"}), patch.object(
-                indeed_checker, "check_indeed_via_api", return_value=helper_result
+                indeed_checker, "lookup_indeed_job", return_value=helper_result
             ) as check:
                 result = probe_indeed(INDEED_ROW)
             check.assert_called_once_with("0123456789abcdef")
@@ -470,12 +470,12 @@ class TransportLoggingTests(unittest.TestCase):
         self.assertNotIn("HTTP Request", output)
 
     def test_indeed_helper_transport_logging_is_quiet(self) -> None:
-        def helper(jk: str) -> str:
+        def helper(jk: str) -> tuple[bool, list[str]]:
             logging.getLogger("httpx").info("HTTP Request: POST https://apis.indeed.com/graphql?k=%s", SECRET)
-            return "active"
+            return False, [jk]
 
         with patch.dict(os.environ, {"INDEED_API_KEY": "fixture-not-a-key"}), patch.object(
-            indeed_checker, "check_indeed_via_api", side_effect=helper
+            indeed_checker, "lookup_indeed_job", side_effect=helper
         ):
             result, output = self._run(probe_indeed, INDEED_ROW)
         self.assertEqual(result.reason, "indeed_expired_false")

@@ -22,6 +22,8 @@ from link_policy import (
     SOURCE_TRIM_CHARS,
     SUPPORTED,
     SUPPORTED_LIFECYCLE_SOURCES,
+    evidence_identities,
+    evidence_identity,
     lifecycle_capability,
     sanitize_evidence_url,
     source_label,
@@ -127,11 +129,20 @@ CREATE TABLE IF NOT EXISTS jobready_link_observations (
     final_url TEXT,
     http_status INTEGER,
     evidence_version TEXT NOT NULL,
+    expected_identity TEXT,
+    observed_identities TEXT[],
     CONSTRAINT jobready_link_observations_job_id_fkey
         FOREIGN KEY (job_id) REFERENCES validated_jobs (job_id) ON DELETE RESTRICT,
     CONSTRAINT jobready_link_observations_observation_check
         CHECK (observation IN ('confirmed_active', 'confirmed_expired', 'inconclusive'))
 );
+
+-- Requisition identity evidence (jobready-validator-v2). Rows written before these columns
+-- keep NULL in both; nothing is backfilled. expected_identity is the provider id the probe
+-- asked for. observed_identities is NULL when no response identity was inspected, empty
+-- when a usable response carried none, else the sorted ids the response exposed.
+ALTER TABLE jobready_link_observations ADD COLUMN IF NOT EXISTS expected_identity TEXT;
+ALTER TABLE jobready_link_observations ADD COLUMN IF NOT EXISTS observed_identities TEXT[];
 
 CREATE INDEX IF NOT EXISTS idx_jobready_link_observations_job_time
     ON jobready_link_observations (job_id, observed_at DESC, id DESC);
@@ -205,6 +216,8 @@ LIFECYCLE_COLUMNS = (
     "final_url",
     "http_status",
     "evidence_version",
+    "expected_identity",
+    "observed_identities",
 )
 LIFECYCLE_INDEXES = (
     "idx_jobready_link_observations_job_time",
@@ -1067,6 +1080,8 @@ CREATE TEMP TABLE lifecycle_batch (
     requested_url TEXT,
     final_url TEXT,
     http_status INTEGER,
+    expected_identity TEXT,
+    observed_identities TEXT[],
     previous_link_status TEXT,
     resulting_link_status TEXT
 ) ON COMMIT DROP
@@ -1101,12 +1116,14 @@ EVIDENCE_LEDGER_SQL = """
 INSERT INTO jobready_link_observations (
     job_id, observed_at, observation, reason, provider,
     previous_link_status, resulting_link_status, run_id,
-    requested_url, final_url, http_status, evidence_version
+    requested_url, final_url, http_status, evidence_version,
+    expected_identity, observed_identities
 )
 SELECT
     job_id, observed_at, observation, reason, provider,
     previous_link_status, resulting_link_status, %s,
-    requested_url, final_url, http_status, evidence_version
+    requested_url, final_url, http_status, evidence_version,
+    expected_identity, observed_identities
 FROM lifecycle_batch
 ORDER BY ord
 """
@@ -1143,6 +1160,7 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
         evidence_version = INJECTED_EVIDENCE_VERSION
         observed_at = datetime.now(timezone.utc)
         requested_url = final_url = http_status = None
+        expected_identity = observed_identities = None
     else:
         job_id = item.job_id
         raw = item.observation
@@ -1153,6 +1171,8 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
         requested_url = getattr(item, "requested_url", None)
         final_url = getattr(item, "final_url", None)
         http_status = getattr(item, "http_status", None)
+        expected_identity = getattr(item, "expected_identity", None)
+        observed_identities = getattr(item, "observed_identities", None)
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("observation job_id is required")
     if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
@@ -1165,6 +1185,13 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
             raise ValueError(f"{name} must be a sanitized http(s) evidence URL")
     if http_status is not None and not valid_http_status(http_status):
         raise ValueError("http_status must be an integer HTTP status code")
+    if expected_identity is not None and evidence_identity(expected_identity) != expected_identity:
+        raise ValueError("expected_identity must be a stored-form evidence identity")
+    if observed_identities is not None and (
+        not isinstance(observed_identities, (list, tuple))
+        or evidence_identities(observed_identities) != tuple(observed_identities)
+    ):
+        raise ValueError("observed_identities must be stored-form evidence identities")
     label = raw if not reason or reason == raw else f"{raw}:{reason}"
     observation = raw if raw in LIFECYCLE_OBSERVATIONS else "inconclusive"
     return (
@@ -1179,6 +1206,8 @@ def _evidence_row(position: int, item: Any) -> tuple[Any, ...]:
         requested_url,
         final_url,
         http_status,
+        expected_identity,
+        None if observed_identities is None else list(observed_identities),
     )
 
 
@@ -1214,7 +1243,8 @@ def apply_link_observations(
             execute_values(
                 cur,
                 "INSERT INTO lifecycle_batch (ord, job_id, observed_at, observation, reason, provider, "
-                "evidence_version, label, requested_url, final_url, http_status) VALUES %s",
+                "evidence_version, label, requested_url, final_url, http_status, "
+                "expected_identity, observed_identities) VALUES %s",
                 rows,
                 page_size=len(rows),
             )

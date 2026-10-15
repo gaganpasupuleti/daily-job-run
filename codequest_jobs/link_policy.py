@@ -117,6 +117,39 @@ def sanitize_evidence_url(value: Any) -> str | None:
     return f"{scheme}://{authority}{parts.path}"
 
 
+EVIDENCE_IDENTITY_MAX_COUNT = 16
+# Plain provider requisition ids (LinkedIn and Naukri digits, Indeed hex job keys).
+_EVIDENCE_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+# Stands in for a provider identity value that is not a plain id. It cannot match a real id.
+REDACTED_IDENTITY = "[redacted]"
+
+
+def evidence_identity(value: Any) -> str | None:
+    """The stored form of one provider requisition identity.
+
+    A plain id is kept as is. Any other value (URL, query, markup, oversized or non-string)
+    is stored only as REDACTED_IDENTITY, so no raw response text is persisted. None stays None.
+    """
+    if value is None:
+        return None
+    return value if isinstance(value, str) and _EVIDENCE_IDENTITY_RE.fullmatch(value) else REDACTED_IDENTITY
+
+
+def evidence_identities(values: Any) -> tuple[str, ...] | None:
+    """The stored form of the identities a provider response exposed.
+
+    None means no response identity was inspected; an empty tuple means a usable response
+    was inspected and carried none. Values are deduplicated, sorted, and capped at
+    EVIDENCE_IDENTITY_MAX_COUNT, so the same evidence always stores the same way.
+    """
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes)):
+        raise TypeError("observed identities must be a collection, not a single value")
+    stored = sorted({evidence_identity(value) for value in values if value is not None})
+    return tuple(stored[:EVIDENCE_IDENTITY_MAX_COUNT])
+
+
 def valid_http_status(value: Any) -> bool:
     """A real three-digit status code. LinkedIn answers bot checks with 999, so 600-999 stay valid."""
     return type(value) is int and 100 <= value <= 999

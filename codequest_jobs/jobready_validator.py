@@ -25,6 +25,8 @@ from link_policy import (
     CONFIRMED_EXPIRED,
     INCONCLUSIVE,
     UNSUPPORTED_SOURCE,
+    evidence_identities,
+    evidence_identity,
     normalize_source,
     sanitize_evidence_url,
     source_label,
@@ -67,9 +69,10 @@ NAUKRI_FLAG_KEYS = ("isExpired", "expired", "isClosed")
 NAUKRI_CLOSED_STATUS = {"expired", "closed", "withdrawn", "inactive"}
 NAUKRI_OPEN_STATUS = {"active", "open", "live"}
 
-# Names the interpretation contract that produced an observation. Change it only when the
-# meaning of a verdict changes, never per run or per deploy.
-JOBREADY_EVIDENCE_VERSION = "jobready-validator-v1"
+# Names the evidence contract that produced an observation: what a verdict means and what
+# each recorded evidence field means. Change it only when one of those changes, never per
+# run or per deploy. v2 adds expected_identity and observed_identities; v1 rows predate them.
+JOBREADY_EVIDENCE_VERSION = "jobready-validator-v2"
 
 
 # httpx logs every request URL at INFO, query string and userinfo included, and httpcore
@@ -110,13 +113,20 @@ class LinkObservation:
     requested_url: str | None = None
     final_url: str | None = None
     http_status: int | None = None
+    # Requisition identity evidence in stored form (link_policy.evidence_identity/ies):
+    # the id the probe asked for, and the ids the provider response exposed.
+    expected_identity: str | None = None
+    observed_identities: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """One provider probe. URLs are sanitized on construction, so raw response URLs never leave it.
+    """One provider probe. URLs and identities are sanitized on construction, so raw response values never leave it.
 
     Provenance is set only for a request that was actually made; otherwise it stays None.
+    expected_identity is the provider id derived before the probe, or None when none could be.
+    observed_identities is None when no response identity was inspected, empty when a usable
+    response was inspected and exposed none, and otherwise the ids that response exposed.
     """
 
     observation: str
@@ -125,19 +135,23 @@ class ProbeResult:
     requested_url: str | None = None
     final_url: str | None = None
     http_status: int | None = None
+    expected_identity: str | None = None
+    observed_identities: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "requested_url", sanitize_evidence_url(self.requested_url))
         object.__setattr__(self, "final_url", sanitize_evidence_url(self.final_url))
         if self.http_status is not None and not valid_http_status(self.http_status):
             raise ValueError("http_status must be an integer HTTP status code")
+        object.__setattr__(self, "expected_identity", evidence_identity(self.expected_identity))
+        object.__setattr__(self, "observed_identities", evidence_identities(self.observed_identities))
 
 
 Probe = Callable[[dict[str, Any]], "ProbeResult | tuple[str, str, str]"]
 
 
 def probe_result(value: ProbeResult | tuple[str, str, str]) -> ProbeResult:
-    """Legacy probes return (observation, reason, provider) and carry no HTTP provenance."""
+    """Legacy probes return (observation, reason, provider) and carry no HTTP provenance or identity evidence."""
     if isinstance(value, ProbeResult):
         return value
     observation, reason, provider = value
@@ -337,52 +351,71 @@ def interpret_linkedin(
     error: str | None = None,
 ) -> tuple[str, str]:
     """Interpret the LinkedIn guest job endpoint for one requested job id."""
+    observation, reason, _identities = interpret_linkedin_evidence(
+        status_code=status_code, body=body, expected_job_id=expected_job_id, final_url=final_url, error=error
+    )
+    return observation, reason
+
+
+def interpret_linkedin_evidence(
+    *,
+    status_code: int | None,
+    body: str | None,
+    expected_job_id: str,
+    final_url: str | None,
+    error: str | None = None,
+) -> tuple[str, str, frozenset[str] | None]:
+    """interpret_linkedin plus the page identities it read.
+
+    The identities are None unless a 200 page from the guest endpoint was inspected;
+    a status-only verdict such as 404/410 reads no page identity.
+    """
     if error or status_code is None:
-        return INCONCLUSIVE, "linkedin_connection_failure"
+        return INCONCLUSIVE, "linkedin_connection_failure", None
     endpoint = GUEST_URL.format(job_id=expected_job_id)
     if not _is_provider_endpoint(final_url, endpoint):
-        return INCONCLUSIVE, "linkedin_redirected"
+        return INCONCLUSIVE, "linkedin_redirected", None
     if status_code in (401, 403, 408, 429, 999) or status_code >= 500:
-        return INCONCLUSIVE, f"linkedin_http_{status_code}"
+        return INCONCLUSIVE, f"linkedin_http_{status_code}", None
     if status_code in (404, 410):
-        return CONFIRMED_EXPIRED, "linkedin_guest_gone"
+        return CONFIRMED_EXPIRED, "linkedin_guest_gone", None
     if status_code != 200:
-        return INCONCLUSIVE, f"linkedin_http_{status_code}"
+        return INCONCLUSIVE, f"linkedin_http_{status_code}", None
     html = body or ""
-    identities = set(LINKEDIN_IDENTITY_RE.findall(html))
+    identities = frozenset(LINKEDIN_IDENTITY_RE.findall(html))
     rendered = NON_RENDERED_RE.sub(" ", html)
     visible = rendered.lower()
     if any(marker in visible for marker in LINKEDIN_BLOCK_MARKERS):
-        return INCONCLUSIVE, "linkedin_blocked"
+        return INCONCLUSIVE, "linkedin_blocked", identities
     if any(marker in visible for marker in LINKEDIN_SOFT_404_MARKERS):
-        return INCONCLUSIVE, "linkedin_soft_404"
+        return INCONCLUSIVE, "linkedin_soft_404", identities
     if not identities:
-        return INCONCLUSIVE, "linkedin_identity_missing"
+        return INCONCLUSIVE, "linkedin_identity_missing", identities
     if identities != {expected_job_id}:
-        return INCONCLUSIVE, "linkedin_identity_mismatch"
+        return INCONCLUSIVE, "linkedin_identity_mismatch", identities
     card = _TopCardParser()
     card.feed(html)
     card.close()
     if card.roots == 0:
-        return INCONCLUSIVE, "linkedin_no_status_region"
+        return INCONCLUSIVE, "linkedin_no_status_region", identities
     if not card.confident:
-        return INCONCLUSIVE, "linkedin_top_card_ambiguous"
+        return INCONCLUSIVE, "linkedin_top_card_ambiguous", identities
     card_text = " ".join(" ".join(card.text).split()).lower()
     closed = card.closed_class or any(marker in card_text for marker in CLOSED_MARKERS)
     apply_state = _linkedin_apply_state(card.actions, endpoint)
     if closed and apply_state == "enabled":
-        return INCONCLUSIVE, "linkedin_conflict"
+        return INCONCLUSIVE, "linkedin_conflict", identities
     if closed:
-        return CONFIRMED_EXPIRED, "linkedin_closed_marker"
+        return CONFIRMED_EXPIRED, "linkedin_closed_marker", identities
     if apply_state == "malformed":
-        return INCONCLUSIVE, "linkedin_apply_malformed"
+        return INCONCLUSIVE, "linkedin_apply_malformed", identities
     if apply_state == "enabled":
-        return CONFIRMED_ACTIVE, "linkedin_identity_apply"
+        return CONFIRMED_ACTIVE, "linkedin_identity_apply", identities
     if apply_state == "disabled":
-        return INCONCLUSIVE, "linkedin_apply_disabled"
+        return INCONCLUSIVE, "linkedin_apply_disabled", identities
     if apply_state == "nonfunctional":
-        return INCONCLUSIVE, "linkedin_apply_nonfunctional"
-    return INCONCLUSIVE, "linkedin_no_apply_evidence"
+        return INCONCLUSIVE, "linkedin_apply_nonfunctional", identities
+    return INCONCLUSIVE, "linkedin_no_apply_evidence", identities
 
 
 def _naukri_flag(value: Any) -> bool | None:
@@ -417,32 +450,53 @@ def interpret_naukri(
     error: str | None = None,
 ) -> tuple[str, str]:
     """A Naukri verdict needs the same job id and an explicit status field."""
+    observation, reason, _identities = interpret_naukri_evidence(
+        status_code=status_code, payload=payload, expected_job_id=expected_job_id, final_url=final_url, error=error
+    )
+    return observation, reason
+
+
+def interpret_naukri_evidence(
+    *,
+    status_code: int | None,
+    payload: Any,
+    expected_job_id: str,
+    final_url: str | None,
+    error: str | None = None,
+) -> tuple[str, str, frozenset[str] | None]:
+    """interpret_naukri plus the job-detail identities it read.
+
+    The identities are None unless a job-detail object from the detail endpoint was
+    inspected; an empty detail object reads as no identities.
+    """
     if error or status_code is None:
-        return INCONCLUSIVE, "naukri_connection_failure"
+        return INCONCLUSIVE, "naukri_connection_failure", None
     if status_code != 200:
-        return INCONCLUSIVE, f"naukri_http_{status_code}"
+        return INCONCLUSIVE, f"naukri_http_{status_code}", None
     if not _is_provider_endpoint(final_url, NAUKRI_DETAIL_URL.format(job_id=expected_job_id)):
-        return INCONCLUSIVE, "naukri_redirected"
+        return INCONCLUSIVE, "naukri_redirected", None
     if not isinstance(payload, dict):
-        return INCONCLUSIVE, "naukri_malformed"
+        return INCONCLUSIVE, "naukri_malformed", None
     job = payload.get("job")
     if not isinstance(job, dict):
         job = payload.get("jobDetails")
-    if not isinstance(job, dict) or not job:
-        return INCONCLUSIVE, "naukri_empty_detail"
-    identities = {str(job[key]).strip() for key in NAUKRI_ID_KEYS if job.get(key) not in (None, "")}
+    if not isinstance(job, dict):
+        return INCONCLUSIVE, "naukri_empty_detail", None
+    identities = frozenset(str(job[key]).strip() for key in NAUKRI_ID_KEYS if job.get(key) not in (None, ""))
+    if not job:
+        return INCONCLUSIVE, "naukri_empty_detail", identities
     if not identities:
-        return INCONCLUSIVE, "naukri_identity_missing"
+        return INCONCLUSIVE, "naukri_identity_missing", identities
     if identities != {expected_job_id}:
-        return INCONCLUSIVE, "naukri_identity_mismatch"
+        return INCONCLUSIVE, "naukri_identity_mismatch", identities
     closed, opened = _naukri_status_signals(job)
     if closed and opened:
-        return INCONCLUSIVE, "naukri_conflict"
+        return INCONCLUSIVE, "naukri_conflict", identities
     if closed:
-        return CONFIRMED_EXPIRED, "naukri_explicit_closed"
+        return CONFIRMED_EXPIRED, "naukri_explicit_closed", identities
     if opened:
-        return CONFIRMED_ACTIVE, "naukri_explicit_open"
-    return INCONCLUSIVE, "naukri_no_status_evidence"
+        return CONFIRMED_ACTIVE, "naukri_explicit_open", identities
+    return INCONCLUSIVE, "naukri_no_status_evidence", identities
 
 
 class UnsupportedSourceError(ValueError):
@@ -491,6 +545,8 @@ def validate_candidates(rows: list[dict[str, Any]], probes: dict[str, Probe] | N
                 requested_url=result.requested_url,
                 final_url=result.final_url,
                 http_status=result.http_status,
+                expected_identity=result.expected_identity,
+                observed_identities=result.observed_identities,
             )
         )
     return observations
@@ -506,20 +562,26 @@ def default_probes() -> dict[str, Probe]:
 
 
 def probe_indeed(row: dict[str, Any]) -> ProbeResult:
-    from indeed_checker import INDEED_GRAPHQL, check_indeed_via_api, indeed_jk_from_url
+    from indeed_checker import INDEED_GRAPHQL, indeed_jk_from_url, lookup_indeed_job
 
     quiet_transport_logging()
+    jk = indeed_jk_from_url(row.get("job_url") or "")
     if not (os.getenv("INDEED_API_KEY") or "").strip():
         observation, reason = interpret_indeed(expired=None, key_configured=False)
-        return ProbeResult(observation, reason, "indeed")
-    jk = indeed_jk_from_url(row.get("job_url") or "")
+        return ProbeResult(observation, reason, "indeed", expected_identity=jk)
     if not jk:
         return ProbeResult(INCONCLUSIVE, "indeed_missing_job_key", "indeed")
-    result = check_indeed_via_api(jk)
-    expired = True if result == "expired" else False if result == "active" else None
+    expired, returned_keys = lookup_indeed_job(jk)
     observation, reason = interpret_indeed(expired=expired, key_configured=True)
-    # The helper does not expose its response, so only the endpoint it posted to is known.
-    return ProbeResult(observation, reason, "indeed", requested_url=INDEED_GRAPHQL)
+    # The helper does not expose its response URL or status, so only the endpoint it posted to is known.
+    return ProbeResult(
+        observation,
+        reason,
+        "indeed",
+        requested_url=INDEED_GRAPHQL,
+        expected_identity=jk,
+        observed_identities=returned_keys,
+    )
 
 
 def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
@@ -535,9 +597,9 @@ def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
         observation, reason = interpret_linkedin(
             status_code=None, body=None, expected_job_id=job_id, final_url=None, error="connection"
         )
-        return ProbeResult(observation, reason, "linkedin", requested_url=endpoint)
+        return ProbeResult(observation, reason, "linkedin", requested_url=endpoint, expected_identity=job_id)
     final_url = str(response.url)
-    observation, reason = interpret_linkedin(
+    observation, reason, identities = interpret_linkedin_evidence(
         status_code=response.status_code,
         body=response.text,
         expected_job_id=job_id,
@@ -550,6 +612,8 @@ def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
         requested_url=endpoint,
         final_url=final_url,
         http_status=response.status_code,
+        expected_identity=job_id,
+        observed_identities=identities,
     )
 
 
@@ -592,7 +656,7 @@ def probe_naukri(row: dict[str, Any]) -> ProbeResult:
         observation, reason = interpret_naukri(
             status_code=None, payload=None, expected_job_id=job_id, final_url=None, error="connection"
         )
-        return ProbeResult(observation, reason, "naukri", requested_url=requested)
+        return ProbeResult(observation, reason, "naukri", requested_url=requested, expected_identity=job_id)
     payload = None
     if response.status_code == 200:
         try:
@@ -600,7 +664,7 @@ def probe_naukri(row: dict[str, Any]) -> ProbeResult:
         except Exception:
             payload = None
     final_url = str(response.url)
-    observation, reason = interpret_naukri(
+    observation, reason, identities = interpret_naukri_evidence(
         status_code=response.status_code,
         payload=payload,
         expected_job_id=job_id,
@@ -613,4 +677,6 @@ def probe_naukri(row: dict[str, Any]) -> ProbeResult:
         requested_url=requested,
         final_url=final_url,
         http_status=response.status_code,
+        expected_identity=job_id,
+        observed_identities=identities,
     )

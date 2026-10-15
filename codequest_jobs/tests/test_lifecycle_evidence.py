@@ -130,7 +130,7 @@ class _CommitFailingConnection:
 
 class ObservationContractTests(unittest.TestCase):
     def test_evidence_version_is_one_stable_constant(self) -> None:
-        self.assertEqual(JOBREADY_EVIDENCE_VERSION, "jobready-validator-v1")
+        self.assertEqual(JOBREADY_EVIDENCE_VERSION, "jobready-validator-v2")
         self.assertEqual(catalog.INJECTED_EVIDENCE_VERSION, "jobready-injected-v1")
         self.assertNotEqual(JOBREADY_EVIDENCE_VERSION, catalog.INJECTED_EVIDENCE_VERSION)
 
@@ -201,12 +201,23 @@ class ImmutabilityContractTests(unittest.TestCase):
             rf"(?:ONLY\s+)?(?:public\.)?{TABLE}\b",
             re.IGNORECASE,
         )
+        # The only permitted schema change is an additive, nullable, no-default column in the
+        # catalog schema; it rewrites no row. Every other ALTER form stays forbidden.
+        additive = re.compile(
+            rf"^ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS [a-z_]+ (?:TEXT|TEXT\[\]);$",
+            re.MULTILINE,
+        )
         inserts = 0
+        additions = 0
         for path in sources:
             text = path.read_text(encoding="utf-8", errors="replace")
+            if path == ROOT / "jobready_catalog.py":
+                additions = len(additive.findall(text))
+                text = additive.sub("", text)
             self.assertIsNone(mutation.search(text), f"ledger mutation in {path.relative_to(REPO)}")
             inserts += len(re.findall(rf"INSERT\s+INTO\s+{TABLE}\b", text, re.IGNORECASE))
         self.assertEqual(inserts, 1)
+        self.assertEqual(additions, 2)
         self.assertNotIn("ON CONFLICT", catalog.EVIDENCE_LEDGER_SQL.upper())
 
 
