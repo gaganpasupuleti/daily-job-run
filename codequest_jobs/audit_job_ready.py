@@ -6,7 +6,8 @@ jobready_validator.py, the same rules run_jobready_daily.py uses. The report
 keeps the stored lifecycle state (persisted_status) separate from what this
 audit observed (observation: confirmed_active, confirmed_expired, or
 inconclusive). An inconclusive check never counts as confirmed_active,
-whatever the stored status was.
+whatever the stored status was. A row on a source without a lifecycle probe is
+reported as unsupported (reason unsupported_source) and is not probed.
 
 This command is read-only. It reads the catalog in a read-only session,
 checks URLs, and writes only its local JSON report. It never changes link_status, writes lifecycle evidence, applies
@@ -35,8 +36,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db import load_env
-from jobready_validator import Probe, default_probes, validate_candidates
-from link_policy import CONFIRMED_ACTIVE, CONFIRMED_EXPIRED, INCONCLUSIVE
+from jobready_validator import Probe, default_probes, probe_for, validate_candidates
+from link_policy import (
+    CONFIRMED_ACTIVE,
+    CONFIRMED_EXPIRED,
+    INCONCLUSIVE,
+    UNSUPPORTED,
+    UNSUPPORTED_SOURCE,
+    normalize_source,
+    source_label,
+)
 
 ENV = ROOT.parent / "naukri_jobs_scraper" / ".env"
 JOBREADY_SYNC_RETIRED = "JOBREADY_SYNC_RETIRED"
@@ -74,40 +83,54 @@ def fetch_job_ready_rows() -> list[dict[str, Any]]:
             rows = [dict(zip(ROW_COLUMNS, raw)) for raw in cur.fetchall()]
     finally:
         conn.close()
-    rows.sort(key=lambda row: (SOURCE_ORDER.get((row["source"] or "").lower(), 9), row["job_id"]))
+    rows.sort(key=lambda row: (SOURCE_ORDER.get(normalize_source(row["source"]), 9), row["job_id"]))
     return rows
 
 
 def audit_row(row: dict[str, Any], probes: dict[str, Probe] | None = None) -> dict[str, Any]:
-    """Return the stored status and this audit's canonical observation for one row."""
+    """Return the stored status and this audit's canonical observation for one row.
+
+    A row whose source has no lifecycle probe is reported as unsupported/unsupported_source
+    with no provider; nothing is probed.
+    """
+    result = {
+        "job_id": row["job_id"],
+        "source": source_label(row.get("source")),
+        "persisted_status": row.get("link_status"),
+    }
+    if probe_for(row.get("source"), probes) is None:
+        return {**result, "observation": UNSUPPORTED, "reason": UNSUPPORTED_SOURCE, "provider": None}
     checked = validate_candidates([row], probes=probes)[0]
     observation = checked.observation if checked.observation in CONCLUSIVE else INCONCLUSIVE
-    return {
-        "job_id": row["job_id"],
-        "source": (row.get("source") or "unknown").strip().lower() or "unknown",
-        "persisted_status": row.get("link_status"),
-        "observation": observation,
-        "reason": checked.reason,
-        "provider": checked.provider,
-    }
+    return {**result, "observation": observation, "reason": checked.reason, "provider": checked.provider}
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Count stored lifecycle state and audit observations separately."""
+    """Count stored lifecycle state and audit observations separately.
+
+    checked counts rows sent to a provider probe; unsupported rows are counted apart.
+    """
     summary: dict[str, Any] = {
-        "checked": len(results),
+        "checked": 0,
         CONFIRMED_ACTIVE: 0,
         CONFIRMED_EXPIRED: 0,
         INCONCLUSIVE: 0,
+        UNSUPPORTED: 0,
+        "unsupported_by_source": {},
         "persisted_active": 0,
         "persisted_expired": 0,
         "persisted_other": 0,
     }
     reasons: dict[str, int] = {}
     crosstab: dict[str, dict[str, int]] = {}
+    unsupported_by_source: dict[str, int] = {}
     for result in results:
         observation = result["observation"]
         summary[observation] += 1
+        if observation == UNSUPPORTED:
+            unsupported_by_source[result["source"]] = unsupported_by_source.get(result["source"], 0) + 1
+        else:
+            summary["checked"] += 1
         persisted = result["persisted_status"]
         bucket = f"persisted_{persisted}" if persisted in ("active", "expired") else "persisted_other"
         summary[bucket] += 1
@@ -115,6 +138,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         reasons[label] = reasons.get(label, 0) + 1
         row = crosstab.setdefault(str(persisted), {})
         row[observation] = row.get(observation, 0) + 1
+    summary["unsupported_by_source"] = dict(sorted(unsupported_by_source.items()))
     summary["validation_reasons"] = dict(sorted(reasons.items()))
     summary["persisted_by_observation"] = {key: dict(sorted(value.items())) for key, value in sorted(crosstab.items())}
     return summary
@@ -143,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = fetch_job_ready_rows()
     by_source: dict[str, int] = {}
     for row in rows:
-        key = (row["source"] or "unknown").lower()
+        key = source_label(row["source"])
         by_source[key] = by_source.get(key, 0) + 1
     print(f"Job-ready availability audit: {len(rows)} links", flush=True)
     print("by_source:", by_source, flush=True)
@@ -162,13 +186,14 @@ def main(argv: list[str] | None = None) -> int:
             if len(results) % 100 == 0:
                 counts = summarize(results)
                 elapsed = time.time() - t0
-                rate = counts["checked"] / elapsed if elapsed else 0
-                left = (len(rows) - counts["checked"]) / rate if rate else 0
+                rate = len(results) / elapsed if elapsed else 0
+                left = (len(rows) - len(results)) / rate if rate else 0
                 print(
-                    f"  progress {counts['checked']}/{len(rows)} "
+                    f"  progress {len(results)}/{len(rows)} "
                     f"confirmed_active={counts[CONFIRMED_ACTIVE]} "
                     f"confirmed_expired={counts[CONFIRMED_EXPIRED]} "
                     f"inconclusive={counts[INCONCLUSIVE]} "
+                    f"unsupported={counts[UNSUPPORTED]} "
                     f"({rate:.1f}/s, ~{left/60:.0f}m left)",
                     flush=True,
                 )

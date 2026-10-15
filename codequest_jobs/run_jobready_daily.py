@@ -39,6 +39,7 @@ from jobready_catalog import (  # noqa: E402
     upsert_jobs,
 )
 from jobready_validator import validate_candidates  # noqa: E402
+from link_policy import SUPPORTED_LIFECYCLE_SOURCES  # noqa: E402
 from normalize import source_job_id  # noqa: E402
 from run_journal import RunJournal  # noqa: E402
 
@@ -263,6 +264,7 @@ def run_daily(
     else:
         journal.skip("catalog_write", "no_rows")
     validation = {"checked": 0, "confirmed_active": 0, "confirmed_expired": 0, "inconclusive": 0, "recorded": 0}
+    validation_selected: int | None = None
     validation_reasons: dict[str, int] = {}
     validation_started = time.perf_counter()
 
@@ -289,6 +291,7 @@ def run_daily(
                 priority_ids=priority,
             )
             release_read_transaction(catalog_conn)
+            validation_selected = len(candidates)
             stage.counters.update(priority=len(priority), selected=len(candidates))
         _stage(f"validation selected={len(candidates)}")
         with journal.stage("validation_probe") as stage:
@@ -366,6 +369,11 @@ def run_daily(
             "catalog_total": totals["total"],
             "catalog_active": totals["active"],
             "catalog_expired": totals["expired"],
+            "validation_supported_sources": sorted(SUPPORTED_LIFECYCLE_SOURCES),
+            "validation_selected": validation_selected,
+            "catalog_supported_rows": totals["supported"],
+            "catalog_unsupported_rows": totals["unsupported"],
+            "catalog_unsupported_by_source": totals["unsupported_by_source"],
             "application_sync": membership,
             "warning": warning,
             "lock_held": hold_lock is not None,
@@ -400,7 +408,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_VALIDATION_LIMIT,
         help=f"Catalog rows to validate on a normal run (default {DEFAULT_VALIDATION_LIMIT}).",
     )
-    parser.add_argument("--full-audit", action="store_true", help="Validate every catalog row.")
+    parser.add_argument("--full-audit", action="store_true", help="Validate every catalog row on a supported lifecycle source.")
     return parser.parse_args(argv)
 
 

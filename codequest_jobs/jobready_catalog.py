@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import string
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -17,7 +18,15 @@ from typing import Any, Callable
 import psycopg2
 from psycopg2.extras import Json, execute_values
 
-from link_policy import sanitize_evidence_url, valid_http_status
+from link_policy import (
+    SOURCE_TRIM_CHARS,
+    SUPPORTED,
+    SUPPORTED_LIFECYCLE_SOURCES,
+    lifecycle_capability,
+    sanitize_evidence_url,
+    source_label,
+    valid_http_status,
+)
 
 # Session lock for the whole daily run. Released on disconnect.
 RUN_LOCK_KEY = 87264011
@@ -208,6 +217,12 @@ INJECTED_EVIDENCE_VERSION = "jobready-injected-v1"
 
 # A normal daily run checks this many catalog rows, oldest first after the priority share.
 DEFAULT_VALIDATION_LIMIT = 200
+# link_policy.normalize_source in PostgreSQL: trim SOURCE_TRIM_CHARS, lowercase ASCII A-Z only.
+# Built from constants, never from catalog data. Bound to sorted(SUPPORTED_LIFECYCLE_SOURCES).
+_SOURCE_TRIM_SQL = " || ".join(f"chr({ord(char)})" for char in SOURCE_TRIM_CHARS)
+SUPPORTED_SOURCE_SQL = (
+    f"translate(btrim(source, {_SOURCE_TRIM_SQL}), '{string.ascii_uppercase}', '{string.ascii_lowercase}') = ANY(%s)"
+)
 
 PRESERVE_WHEN_BLANK = {
     "company",
@@ -1229,16 +1244,25 @@ def select_validation_candidates(
     full_audit: bool = False,
     priority_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rotate through the catalog. Half of a normal budget is reserved for unconfirmed rows."""
+    """Rotate through rows on supported lifecycle sources. Half of a normal budget is reserved for unconfirmed rows.
+
+    Rows on unsupported sources are never selected, so they use no budget, priority included.
+    """
     columns = (
         "job_id, source, job_url, apply_url, link_status, link_checked_at, last_link_observation"
     )
     names = ["job_id", "source", "job_url", "apply_url", "link_status", "link_checked_at", "last_link_observation"]
     priority_ids = [job_id for job_id in (priority_ids or []) if job_id]
+    supported = sorted(SUPPORTED_LIFECYCLE_SOURCES)
     with conn.cursor() as cur:
         if full_audit:
             cur.execute(
-                f"SELECT {columns} FROM validated_jobs ORDER BY link_checked_at NULLS FIRST, job_id"
+                f"""
+                SELECT {columns} FROM validated_jobs
+                WHERE {SUPPORTED_SOURCE_SQL}
+                ORDER BY link_checked_at NULLS FIRST, job_id
+                """,
+                (supported,),
             )
             return [_row_dict(names, row) for row in cur.fetchall()]
         selected: list[dict[str, Any]] = []
@@ -1248,11 +1272,11 @@ def select_validation_candidates(
             cur.execute(
                 f"""
                 SELECT {columns} FROM validated_jobs
-                WHERE job_id = ANY(%s)
+                WHERE job_id = ANY(%s) AND {SUPPORTED_SOURCE_SQL}
                 ORDER BY link_checked_at NULLS FIRST, job_id
                 LIMIT %s
                 """,
-                (priority_ids, priority_budget),
+                (priority_ids, supported, priority_budget),
             )
             for row in cur.fetchall():
                 item = _row_dict(names, row)
@@ -1264,20 +1288,21 @@ def select_validation_candidates(
                 cur.execute(
                     f"""
                     SELECT {columns} FROM validated_jobs
-                    WHERE NOT (job_id = ANY(%s))
+                    WHERE NOT (job_id = ANY(%s)) AND {SUPPORTED_SOURCE_SQL}
                     ORDER BY link_checked_at NULLS FIRST, job_id
                     LIMIT %s
                     """,
-                    (seen, remaining),
+                    (seen, supported, remaining),
                 )
             else:
                 cur.execute(
                     f"""
                     SELECT {columns} FROM validated_jobs
+                    WHERE {SUPPORTED_SOURCE_SQL}
                     ORDER BY link_checked_at NULLS FIRST, job_id
                     LIMIT %s
                     """,
-                    (remaining,),
+                    (supported, remaining),
                 )
             selected.extend(_row_dict(names, row) for row in cur.fetchall())
     return selected
@@ -1295,16 +1320,32 @@ def mark_confirmed_expired(conn, job_ids: list[str]) -> int:
     return apply_link_observations(conn, observations)["confirmed_expired"]
 
 
-def catalog_counts(conn) -> dict[str, int]:
+def catalog_counts(conn) -> dict[str, Any]:
+    """Catalog totals and lifecycle capability counts. supported + unsupported == total."""
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT
+              source,
               COUNT(*),
               COUNT(*) FILTER (WHERE link_status = 'active'),
               COUNT(*) FILTER (WHERE link_status = 'expired')
             FROM validated_jobs
+            GROUP BY source
             """
         )
-        total, active, expired = cur.fetchone()
-    return {"total": int(total), "active": int(active), "expired": int(expired)}
+        rows = cur.fetchall()
+    counts: dict[str, Any] = {"total": 0, "active": 0, "expired": 0, "supported": 0, "unsupported": 0}
+    unsupported_by_source: dict[str, int] = {}
+    for source, total, active, expired in rows:
+        counts["total"] += int(total)
+        counts["active"] += int(active)
+        counts["expired"] += int(expired)
+        if lifecycle_capability(source) == SUPPORTED:
+            counts["supported"] += int(total)
+        else:
+            counts["unsupported"] += int(total)
+            label = source_label(source)
+            unsupported_by_source[label] = unsupported_by_source.get(label, 0) + int(total)
+    counts["unsupported_by_source"] = dict(sorted(unsupported_by_source.items()))
+    return counts

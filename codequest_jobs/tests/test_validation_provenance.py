@@ -38,6 +38,7 @@ from jobready_validator import (  # noqa: E402
     JOBREADY_EVIDENCE_VERSION,
     LinkObservation,
     ProbeResult,
+    UnsupportedSourceError,
     interpret_linkedin,
     probe_indeed,
     probe_linkedin,
@@ -239,11 +240,13 @@ class ObservationCompatibilityTests(unittest.TestCase):
         self.assertEqual(_provenance(item), (None, None, None))
         self.assertNotIn(SECRET, repr(item))
 
-    def test_generic_validation_has_no_provenance(self) -> None:
+    def test_unsupported_source_is_refused_without_provenance(self) -> None:
         rows = [{"job_id": "CQJ-g", "source": "foundit", "job_url": "https://www.foundit.in/job/1?token=x"}]
-        (item,) = validate_candidates(rows)
-        self.assertEqual((item.observation, item.reason, item.provider), ("inconclusive", "foundit_no_explicit_closure", "foundit"))
-        self.assertEqual(_provenance(item), (None, None, None))
+        with self.assertRaises(UnsupportedSourceError) as caught:
+            validate_candidates(rows)
+        self.assertEqual(str(caught.exception), "unsupported_source")
+        self.assertEqual(caught.exception.sources, ["foundit"])
+        self.assertNotIn("token", repr(caught.exception))
 
 
 class LinkedInProvenanceTests(unittest.TestCase):
