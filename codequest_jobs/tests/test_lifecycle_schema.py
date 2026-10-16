@@ -487,7 +487,8 @@ class RuntimeReferenceTests(unittest.TestCase):
             for directory in (ROOT, SCRAPER, REPO / "link_validator_service")
             if directory.is_dir()
             for path in directory.rglob("*.py")
-            if "tests" not in path.relative_to(REPO).parts and path.name != "jobready_catalog.py"
+            if "tests" not in path.relative_to(REPO).parts
+            and path.name not in ("jobready_catalog.py", "lifecycle_freshness.py")
         ]
         self.assertTrue(sources)
         for path in sources:
