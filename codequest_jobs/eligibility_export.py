@@ -26,7 +26,6 @@ from lifecycle_freshness import (
 from lifecycle_projection import (
     CONFIRMED_CLOSED,
     CONFIRMED_OPEN,
-    UNRESOLVED,
     LifecycleProjection,
     LifecycleProjectionObservation,
     project_lifecycle,
@@ -234,9 +233,6 @@ def _decide_eligibility(
     hold = _freshness_hold_reason(freshness)
     if hold is not None:
         reasons.append(hold)
-    if projection.review_required and projection.decision == UNRESOLVED:
-        if REASON_LIFECYCLE_CONFLICT_REVIEW not in reasons:
-            reasons.append(REASON_LIFECYCLE_CONFLICT_REVIEW)
 
     false_prereq = any(
         value == TRI_FALSE

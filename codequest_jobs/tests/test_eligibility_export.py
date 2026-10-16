@@ -435,6 +435,59 @@ class EligibilityMatrixTests(unittest.TestCase):
             self.assertNotEqual(artifact.eligibility_decision, DECISION_ELIGIBLE)
 
 
+class UnconfirmedVsConflictReasonTests(unittest.TestCase):
+    def test_empty_observations_unconfirmed_not_conflict(self) -> None:
+        artifact = _export([], at=T0)
+        self.assertEqual(artifact.eligibility_decision, DECISION_HELD)
+        self.assertIn(REASON_LIFECYCLE_UNCONFIRMED, artifact.eligibility_reasons)
+        self.assertNotIn(REASON_LIFECYCLE_CONFLICT_REVIEW, artifact.eligibility_reasons)
+
+    def test_injected_only_unconfirmed_not_conflict(self) -> None:
+        artifact = _export([_obs("inj", "confirmed_active", T0, provider="injected")], at=T0)
+        self.assertEqual(artifact.eligibility_decision, DECISION_HELD)
+        self.assertIn(REASON_LIFECYCLE_UNCONFIRMED, artifact.eligibility_reasons)
+        self.assertNotIn(REASON_LIFECYCLE_CONFLICT_REVIEW, artifact.eligibility_reasons)
+
+    def test_unsupported_without_d16_conflict(self) -> None:
+        artifact = export_job_eligibility(
+            job_id="job-1",
+            source="google",
+            observations=[],
+            evaluation_time=T0,
+            freshness_policy=_policy(),
+            prerequisites=_all_true(),
+        )
+        self.assertEqual(artifact.eligibility_decision, DECISION_HELD)
+        self.assertIn(REASON_LIFECYCLE_UNSUPPORTED, artifact.eligibility_reasons)
+        self.assertNotIn(REASON_LIFECYCLE_CONFLICT_REVIEW, artifact.eligibility_reasons)
+
+    def test_equal_time_conflict_reason_present(self) -> None:
+        items = [_obs("a", "confirmed_active", T0), _obs("b", "confirmed_expired", T0)]
+        artifact = _export(items, at=T0)
+        self.assertEqual(artifact.eligibility_decision, DECISION_HELD)
+        self.assertIn(REASON_LIFECYCLE_CONFLICT_REVIEW, artifact.eligibility_reasons)
+
+    def test_authority_time_conflict_reason_present(self) -> None:
+        from lifecycle_projection import LifecycleAuthorityPolicy
+
+        policy = LifecycleAuthorityPolicy("ranked", {"high": 20, "low": 10})
+        items = [
+            _obs("high", "confirmed_expired", T0, provider="high"),
+            _obs("low", "confirmed_active", T1, provider="low"),
+        ]
+        artifact = export_job_eligibility(
+            job_id="job-1",
+            source="naukri",
+            observations=items,
+            evaluation_time=T1,
+            freshness_policy=_policy(),
+            prerequisites=_all_true(),
+            lifecycle_projection=project_lifecycle(items, policy=policy),
+        )
+        self.assertEqual(artifact.eligibility_decision, DECISION_HELD)
+        self.assertIn(REASON_LIFECYCLE_CONFLICT_REVIEW, artifact.eligibility_reasons)
+
+
 class IntegrationFlowTests(unittest.TestCase):
     def test_canonical_fresh_open_eligible(self) -> None:
         items = [_obs("a", "confirmed_active", T0)]
