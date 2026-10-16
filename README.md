@@ -71,6 +71,16 @@ Ledger rows also carry requisition identity evidence, written in the same row an
 - Recording evidence changes no visibility or membership behavior. `link_status` follows the ordering rule above.
 - The foreign key needs `validated_jobs.job_id` to be unique, which `SCHEMA_SQL` declares. If a catalog lacks that constraint, `--apply-schema` fails and applies nothing.
 
+### Shadow lifecycle projection (D16)
+
+`codequest_jobs/lifecycle_projection.py` is a pure, read-only decision layer over immutable lifecycle observations. It does not write to the ledger, change `link_status`, implement freshness/TTL, or decide eligibility/publication.
+
+- Shadow vocabulary is `confirmed_open`, `confirmed_closed`, or `unresolved` (not catalog `active`/`expired`).
+- Authority is an explicit policy object. The default policy treats LinkedIn, Naukri, and Indeed as one canonical class with no invented relative ranking. Injected and unknown providers are non-authoritative.
+- Resolution combines observation time and authority: an observation dominates an opposing one only when it is at least as authoritative and at least as recent, with at least one dimension strictly stronger. Equal-time or authority/time disagreements return `unresolved` with `review_required`.
+- Inconclusive rows are latest-attempt context only. They do not open, close, or create conflicts.
+- Output references evidence ids (or synthetic refs in tests) so later eligibility export can explain the decision.
+
 Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
 
 Required configuration: `JOB_READY_DATABASE_URL`.
