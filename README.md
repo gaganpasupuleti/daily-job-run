@@ -81,6 +81,15 @@ Ledger rows also carry requisition identity evidence, written in the same row an
 - Inconclusive rows are latest-attempt context only. They do not open, close, or create conflicts.
 - Output references evidence ids (or synthetic refs in tests) so later eligibility export can explain the decision.
 
+### Shadow evidence freshness (D18)
+
+`codequest_jobs/lifecycle_freshness.py` is a pure, read-only evidence-age layer over D16 `LifecycleProjection`. It does not write to the ledger, change `link_status`, or decide final eligibility or publication (D17).
+
+- Positive confirmed-open freshness uses an explicit `LifecycleFreshnessPolicy` input (including `confirmed_open_ttl`). No production TTL is chosen in code.
+- TTL expiry means stale/held positive evidence, not employer-closed. Confirmed closed from D16 stays closed regardless of an older open timestamp.
+- D16 unresolved conflicts become `review_hold`; absent or non-authoritative conclusive evidence becomes `unconfirmed`. Fresh timestamps do not bypass D16 contradictions.
+- Unsupported lifecycle sources use the same capability rules as `link_policy`. Evaluation time is always supplied by the caller for reproducibility.
+
 Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
 
 Required configuration: `JOB_READY_DATABASE_URL`.
