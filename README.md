@@ -90,6 +90,14 @@ Ledger rows also carry requisition identity evidence, written in the same row an
 - D16 unresolved conflicts become `review_hold`; absent or non-authoritative conclusive evidence becomes `unconfirmed`. Fresh timestamps do not bypass D16 contradictions.
 - Unsupported lifecycle sources use the same capability rules as `link_policy`. Evaluation time is always supplied by the caller for reproducibility.
 
+### Versioned shadow eligibility export (D17)
+
+`codequest_jobs/eligibility_export.py` emits contract `jobready-eligibility-v1` per-job shadow eligibility artifacts by composing D16 lifecycle projection and D18 freshness. It does not write catalog or application membership, publish jobs, or choose a production TTL.
+
+- Eligible only when lifecycle is authoritatively `confirmed_open`, freshness is `fresh`, D16 review is not required, and every prerequisite is explicitly `true`. Unknown prerequisites hold.
+- Stale positive evidence is `held`, not employer-closed. Unsupported or conflicting lifecycle evidence holds for review.
+- Authoritative open freshness anchors derive from controlling D16 `confirmed_active` observations, not catalog summary timestamps or `link_status`.
+
 Experience buckets stored for JobReady are `Internship`, `Fresher`, `Entry (1-2 yrs)`, `Experienced`, and `Unknown / Unclassified`.
 
 Required configuration: `JOB_READY_DATABASE_URL`.
