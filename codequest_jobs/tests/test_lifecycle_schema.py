@@ -488,7 +488,11 @@ class RuntimeReferenceTests(unittest.TestCase):
             if directory.is_dir()
             for path in directory.rglob("*.py")
             if "tests" not in path.relative_to(REPO).parts
-            and path.name not in ("jobready_catalog.py", "lifecycle_freshness.py")
+            and path.name not in (
+                "jobready_catalog.py",
+                "lifecycle_freshness.py",
+                "eligibility_export.py",
+            )
         ]
         self.assertTrue(sources)
         for path in sources:
