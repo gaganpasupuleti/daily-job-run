@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from link_policy import (
@@ -93,10 +94,10 @@ class LifecycleAuthorityPolicy:
     def __post_init__(self) -> None:
         if not isinstance(self.policy_id, str) or not self.policy_id.strip():
             raise ValueError("policy_id is required")
-        frozen = {str(key): int(value) for key, value in dict(self.ranks).items()}
-        if any(rank < 0 for rank in frozen.values()):
+        copied = {str(key): int(value) for key, value in dict(self.ranks).items()}
+        if any(rank < 0 for rank in copied.values()):
             raise ValueError("authority ranks must be non-negative")
-        object.__setattr__(self, "ranks", frozen)
+        object.__setattr__(self, "ranks", MappingProxyType(copied))
 
     def authority_rank(self, provider: str) -> int | None:
         """Return the authority rank, or None when the provider is non-authoritative."""

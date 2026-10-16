@@ -127,6 +127,55 @@ class AuthorityPolicyTests(unittest.TestCase):
         self.assertFalse(policy.is_authoritative(""))
 
 
+class AuthorityPolicyImmutabilityTests(unittest.TestCase):
+    def test_ranks_detach_from_caller_mapping(self) -> None:
+        source = {"high": 20, "low": 10}
+        policy = LifecycleAuthorityPolicy("synthetic-v1", source)
+        source["high"] = 1
+        source["new"] = 999
+        self.assertEqual(policy.authority_rank("high"), 20)
+        self.assertIsNone(policy.authority_rank("new"))
+
+    def test_ranks_reject_direct_mutation(self) -> None:
+        policy = LifecycleAuthorityPolicy("synthetic-v1", {"high": 20, "low": 10})
+        with self.assertRaises(TypeError):
+            policy.ranks["high"] = 5
+        with self.assertRaises(TypeError):
+            policy.ranks["new"] = 100
+        with self.assertRaises(TypeError):
+            del policy.ranks["low"]
+
+    def test_projection_unchanged_when_mutation_blocked(self) -> None:
+        policy = LifecycleAuthorityPolicy("synthetic-v1", {"high": 20, "low": 10})
+        items = [
+            _obs("high", "confirmed_expired", T10, provider="high"),
+            _obs("low", "confirmed_active", T11, provider="low"),
+        ]
+        before = project_lifecycle(items, policy=policy)
+        with self.assertRaises(TypeError):
+            policy.ranks["high"] = 5
+        with self.assertRaises(TypeError):
+            policy.ranks["new"] = 100
+        with self.assertRaises(TypeError):
+            del policy.ranks["low"]
+        after = project_lifecycle(items, policy=policy)
+        self.assertEqual(before, after)
+
+    def test_default_policy_ranks_cannot_be_mutated(self) -> None:
+        policy = default_authority_policy()
+        for provider in ("injected", "foundit", "google", "unknown-provider"):
+            with self.assertRaises(TypeError):
+                policy.ranks[provider] = 999
+        self.assertFalse(policy.is_authoritative("injected"))
+        self.assertFalse(policy.is_authoritative("foundit"))
+        self.assertFalse(policy.is_authoritative("google"))
+        self.assertFalse(policy.is_authoritative("unknown-provider"))
+        self.assertEqual(
+            {policy.authority_rank(name) for name in ("linkedin", "naukri", "indeed")},
+            {100},
+        )
+
+
 class ProjectionMatrixTests(unittest.TestCase):
     """Cases 1-28 from the D16 matrix."""
 
