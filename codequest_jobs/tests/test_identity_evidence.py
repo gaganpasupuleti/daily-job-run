@@ -992,7 +992,10 @@ class IdentityPersistenceTests(_CatalogCase):
             self._fetch(f"SELECT requested_url, final_url, http_status FROM {TABLE} ORDER BY id"),
             [(GUEST, GUEST, 200), (NAUKRI_ENDPOINT, NAUKRI_ENDPOINT, 200), (indeed_checker.INDEED_GRAPHQL, None, None)],
         )
-        self.assertEqual(sorted(requests.urls), sorted([GUEST, indeed_checker.INDEED_GRAPHQL]))
+        self.assertEqual(
+            sorted(requests.urls),
+            sorted([GUEST] + [indeed_checker.INDEED_GRAPHQL] * retry_policy.INDEED_LIFECYCLE_RETRY.max_attempts),
+        )
         self.assertEqual(len(naukri_requests.urls), 1)
 
     def test_daily_path_persists_identity(self) -> None:
