@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from retry_policy import INDEED_LIFECYCLE_RETRY, execute_http_with_retry
+
 logger = logging.getLogger(__name__)
 
 INDEED_GRAPHQL = "https://apis.indeed.com/graphql"
@@ -143,15 +145,24 @@ def _post_job_data(client: httpx.Client, chunk: list[str]) -> object | None:
         + json.dumps(chunk)
         + ") { results { job { key expired } } } }"
     )
+    headers = indeed_headers()
+    body = {"query": query}
+
+    def _post() -> httpx.Response:
+        return client.post(INDEED_GRAPHQL, headers=headers, json=body)
+
     try:
-        resp = client.post(
-            INDEED_GRAPHQL,
-            headers=indeed_headers(),
-            json={"query": query},
-        )
-        if resp.status_code != 200:
-            logger.warning("Indeed GraphQL HTTP %s", resp.status_code)
-            return None
+        resp, transport_error = execute_http_with_retry(_post, INDEED_LIFECYCLE_RETRY)
+    except Exception as exc:
+        logger.warning("Indeed GraphQL batch failed: %s", exc)
+        return None
+    if transport_error is not None or resp is None:
+        logger.warning("Indeed GraphQL batch failed: %s", transport_error)
+        return None
+    if resp.status_code != 200:
+        logger.warning("Indeed GraphQL HTTP %s", resp.status_code)
+        return None
+    try:
         return resp.json()
     except Exception as exc:
         logger.warning("Indeed GraphQL batch failed: %s", exc)

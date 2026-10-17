@@ -31,6 +31,7 @@ import psycopg2  # noqa: E402
 import psycopg2.errors  # noqa: E402
 
 import indeed_checker  # noqa: E402
+import retry_policy  # noqa: E402
 import jobready_catalog as catalog  # noqa: E402
 import run_jobready_daily as daily  # noqa: E402
 from jobready_validator import (  # noqa: E402
@@ -80,6 +81,12 @@ T12 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 JK = "0123456789abcdef"
 OTHER_JK = "fedcba9876543210"
 FIXTURE_KEY = "fixture-not-a-key"
+
+
+def _retryable_status_attempts(status: int, policy: retry_policy.LifecycleRetryPolicy) -> int:
+    if status in policy.retryable_status_codes:
+        return policy.max_attempts
+    return 1
 
 
 def _identity(item) -> tuple:
@@ -247,8 +254,9 @@ class LinkedInIdentityTests(unittest.TestCase):
         return result, requests
 
     def _page(self, body: str, status: int = 200):
+        expected = _retryable_status_attempts(status, retry_policy.LINKEDIN_LIFECYCLE_RETRY)
         result, requests = self._probe(lambda request: httpx.Response(status, text=body))
-        self.assertEqual(requests.urls, [GUEST])
+        self.assertEqual(len(requests.urls), expected)
         return result
 
     def test_01_match(self) -> None:
@@ -299,7 +307,7 @@ class LinkedInIdentityTests(unittest.TestCase):
     def test_07_connection_failure(self) -> None:
         result, requests = self._probe(_refuse)
         self.assertEqual(_verdict(result), ("inconclusive", "linkedin_connection_failure"))
-        self.assertEqual(requests.urls, [GUEST])
+        self.assertEqual(len(requests.urls), retry_policy.LINKEDIN_LIFECYCLE_RETRY.max_attempts)
         self.assertEqual(_identity(result), (JOB_ID, None))
 
     def test_08_404(self) -> None:
@@ -349,8 +357,9 @@ class NaukriIdentityTests(unittest.TestCase):
         return result, requests
 
     def _json(self, payload, status: int = 200):
+        expected = _retryable_status_attempts(status, retry_policy.NAUKRI_LIFECYCLE_RETRY)
         result, requests = self._probe(lambda request: httpx.Response(status, json=payload))
-        self.assertEqual(len(requests.urls), 1)
+        self.assertEqual(len(requests.urls), expected)
         return result
 
     def test_10_match(self) -> None:
@@ -406,7 +415,7 @@ class NaukriIdentityTests(unittest.TestCase):
     def test_16_connection_failure(self) -> None:
         result, requests = self._probe(_refuse)
         self.assertEqual(_verdict(result), ("inconclusive", "naukri_connection_failure"))
-        self.assertEqual(len(requests.urls), 1)
+        self.assertEqual(len(requests.urls), retry_policy.NAUKRI_LIFECYCLE_RETRY.max_attempts)
         self.assertEqual(_identity(result), (NAUKRI_ID, None))
 
     def test_17_non_200(self) -> None:
@@ -508,13 +517,14 @@ class IndeedIdentityTests(unittest.TestCase):
             self.assertEqual(_identity(result), (JK, None), payload)
 
     def test_23_undecodable_and_non_200_responses(self) -> None:
-        for handler in (
-            lambda request: httpx.Response(200, text="<html>not json</html>"),
-            lambda request: httpx.Response(500, json=_indeed_results({"key": JK, "expired": True})),
-            lambda request: httpx.Response(403, text="forbidden"),
-        ):
+        cases = (
+            (lambda request: httpx.Response(200, text="<html>not json</html>"), 1),
+            (lambda request: httpx.Response(500, json=_indeed_results({"key": JK, "expired": True})), retry_policy.INDEED_LIFECYCLE_RETRY.max_attempts),
+            (lambda request: httpx.Response(403, text="forbidden"), 1),
+        )
+        for handler, expected_attempts in cases:
             result, requests = self._probe(handler)
-            self.assertEqual(len(requests.urls), 1)
+            self.assertEqual(len(requests.urls), expected_attempts)
             self.assertEqual(_verdict(result), ("inconclusive", "indeed_api_error"))
             self.assertEqual(_identity(result), (JK, None))
 
@@ -528,7 +538,7 @@ class IndeedIdentityTests(unittest.TestCase):
 
     def test_24_connection_failure(self) -> None:
         result, requests = self._probe(_refuse)
-        self.assertEqual(requests.urls, [indeed_checker.INDEED_GRAPHQL])
+        self.assertEqual(len(requests.urls), retry_policy.INDEED_LIFECYCLE_RETRY.max_attempts)
         self.assertEqual(_verdict(result), ("inconclusive", "indeed_api_error"))
         self.assertEqual(_identity(result), (JK, None))
 

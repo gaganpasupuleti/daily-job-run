@@ -56,6 +56,8 @@ HTTP provenance is evidence only. It does not change how observations are interp
 - Generic sources, unrecognized job URLs, probe errors, and injected observations (`jobready-injected-v1`) store `NULL` provenance.
 - The validator keeps the `httpx` and `httpcore` loggers at `WARNING` or stricter, so request URLs are not printed in logs.
 
+Lifecycle transport for LinkedIn, Naukri, and Indeed uses bounded, source-aware retries (`codequest_jobs/retry_policy.py`). Retries are transport-only: provider open/closed verdict rules are unchanged. Retry exhaustion stays `inconclusive`; it does not confirm closure. `Retry-After` is honored within a configured maximum delay. Internal retries do not create extra lifecycle observations—one validation still yields one ledger row. Provenance reflects the final HTTP response used for the observation.
+
 Ledger rows also carry requisition identity evidence, written in the same row and transaction. Like provenance, it explains a verdict and never changes one.
 
 - `expected_identity` is the provider job id the probe asked for: the LinkedIn job id, the Naukri job id, or the Indeed `jk` parsed from the catalog URL. It is `NULL` when no id could be parsed.

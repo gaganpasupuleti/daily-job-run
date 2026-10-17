@@ -33,6 +33,7 @@ from link_policy import (
     valid_http_status,
 )
 from linkedin_checker import CLOSED_MARKERS, GUEST_URL, HEADERS, linkedin_job_id_from_url
+from retry_policy import LINKEDIN_LIFECYCLE_RETRY, NAUKRI_LIFECYCLE_RETRY, execute_http_with_retry
 
 LINKEDIN_IDENTITY_RE = re.compile(
     r'id="decoratedJobPostingId"[^>]*>\s*<!--\s*"?(\d+)"?\s*-->',
@@ -590,10 +591,12 @@ def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
     if not job_id:
         return ProbeResult(INCONCLUSIVE, "linkedin_unrecognized_url", "linkedin")
     endpoint = GUEST_URL.format(job_id=job_id)
-    try:
-        with httpx.Client(timeout=8.0, follow_redirects=True, headers=HEADERS) as client:
-            response = client.get(endpoint)
-    except httpx.HTTPError:
+    with httpx.Client(timeout=8.0, follow_redirects=True, headers=HEADERS) as client:
+        response, transport_error = execute_http_with_retry(
+            lambda: client.get(endpoint),
+            LINKEDIN_LIFECYCLE_RETRY,
+        )
+    if transport_error is not None or response is None:
         observation, reason = interpret_linkedin(
             status_code=None, body=None, expected_job_id=job_id, final_url=None, error="connection"
         )
@@ -639,17 +642,24 @@ def probe_naukri(row: dict[str, Any]) -> ProbeResult:
         try:
             # Set only once the detail request is issued; a failed session warm-up is not one.
             requested = endpoint
-            response = client._client.get(
-                endpoint,
-                params={"microsite": "y", "src": "jobsearchDesk", "xp": "1", "px": "1"},
-                headers={
-                    "Accept": "application/json",
-                    "appid": "121",
-                    "systemid": "Naukri",
-                    "clientid": "d3skt0p",
-                    "nkparam": generate_nkparam("jd"),
-                },
-            )
+            detail_headers = {
+                "Accept": "application/json",
+                "appid": "121",
+                "systemid": "Naukri",
+                "clientid": "d3skt0p",
+                "nkparam": generate_nkparam("jd"),
+            }
+            detail_params = {"microsite": "y", "src": "jobsearchDesk", "xp": "1", "px": "1"}
+
+            def _detail_request() -> httpx.Response:
+                return client._client.get(endpoint, params=detail_params, headers=detail_headers)
+
+            response, transport_error = execute_http_with_retry(_detail_request, NAUKRI_LIFECYCLE_RETRY)
+            if transport_error is not None or response is None:
+                observation, reason = interpret_naukri(
+                    status_code=None, payload=None, expected_job_id=job_id, final_url=None, error="connection"
+                )
+                return ProbeResult(observation, reason, "naukri", requested_url=requested, expected_identity=job_id)
         finally:
             client.close()
     except Exception:
