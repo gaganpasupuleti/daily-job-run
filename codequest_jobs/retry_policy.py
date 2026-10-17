@@ -86,6 +86,13 @@ INDEED_LIFECYCLE_RETRY = LifecycleRetryPolicy(
     max_delay_seconds=4.0,
 )
 
+GREENHOUSE_LIFECYCLE_RETRY = LifecycleRetryPolicy(
+    policy_id="greenhouse-lifecycle-retry-v1",
+    max_attempts=3,
+    base_delay_seconds=0.5,
+    max_delay_seconds=4.0,
+)
+
 
 def parse_retry_after_seconds(
     value: str | None,

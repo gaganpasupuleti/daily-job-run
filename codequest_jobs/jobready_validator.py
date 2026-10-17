@@ -556,10 +556,48 @@ def validate_candidates(rows: list[dict[str, Any]], probes: dict[str, Probe] | N
 def default_probes() -> dict[str, Probe]:
     """Provider lifecycle probes. The keys are link_policy.SUPPORTED_LIFECYCLE_SOURCES; there is no fallback."""
     return {
+        "greenhouse": probe_greenhouse,
         "indeed": probe_indeed,
         "linkedin": probe_linkedin,
         "naukri": probe_naukri,
     }
+
+
+def probe_greenhouse(row: dict[str, Any]) -> ProbeResult:
+    from greenhouse_checker import (
+        _credentials_present,
+        greenhouse_job_post_id_from_url,
+        lookup_greenhouse_lifecycle,
+    )
+
+    quiet_transport_logging()
+    post_id, conflict = greenhouse_job_post_id_from_url(row.get("job_url") or "")
+    if conflict:
+        return ProbeResult(INCONCLUSIVE, conflict, "greenhouse")
+    if not post_id:
+        return ProbeResult(INCONCLUSIVE, "greenhouse_unrecognized_url", "greenhouse")
+    if not _credentials_present():
+        return ProbeResult(INCONCLUSIVE, "greenhouse_auth_missing", "greenhouse", expected_identity=post_id)
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            evidence = lookup_greenhouse_lifecycle(post_id, client)
+    except httpx.HTTPError:
+        return ProbeResult(
+            INCONCLUSIVE,
+            "greenhouse_connection_failure",
+            "greenhouse",
+            expected_identity=post_id,
+        )
+    return ProbeResult(
+        evidence.observation,
+        evidence.reason,
+        "greenhouse",
+        requested_url=evidence.requested_url,
+        final_url=evidence.final_url,
+        http_status=evidence.http_status,
+        expected_identity=post_id,
+        observed_identities=evidence.observed_identities,
+    )
 
 
 def probe_indeed(row: dict[str, Any]) -> ProbeResult:

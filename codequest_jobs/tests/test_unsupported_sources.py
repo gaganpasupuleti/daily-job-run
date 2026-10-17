@@ -99,7 +99,7 @@ class _Network:
 
 class CapabilityTests(unittest.TestCase):
     def test_supported_sources_are_exactly_those_with_a_provider_probe(self) -> None:
-        self.assertEqual(SUPPORTED_LIFECYCLE_SOURCES, frozenset({"linkedin", "naukri", "indeed"}))
+        self.assertEqual(SUPPORTED_LIFECYCLE_SOURCES, frozenset({"greenhouse", "indeed", "linkedin", "naukri"}))
         self.assertEqual(set(validator.default_probes()), set(SUPPORTED_LIFECYCLE_SOURCES))
         self.assertIs(validator.default_probes()["linkedin"], validator.probe_linkedin)
         self.assertIs(validator.default_probes()["naukri"], validator.probe_naukri)
@@ -510,7 +510,7 @@ class DailyUnsupportedTests(_CatalogFixture):
         self.assertEqual(
             report["validation_reasons"], {"confirmed_active:fixture_open": 4, "inconclusive:naukri_http_500": 4}
         )
-        self.assertEqual(report["validation_supported_sources"], ["indeed", "linkedin", "naukri"])
+        self.assertEqual(report["validation_supported_sources"], ["greenhouse", "indeed", "linkedin", "naukri"])
         self.assertEqual(report["catalog_supported_rows"], 8)
         self.assertEqual(report["catalog_unsupported_rows"], 8)
         self.assertEqual(report["catalog_unsupported_by_source"], {"foundit": 4, "google": 4})
