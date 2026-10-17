@@ -75,6 +75,7 @@ class LifecycleRetryPolicyTests(unittest.TestCase):
         self.assertEqual(rp.LINKEDIN_LIFECYCLE_RETRY.policy_id, "linkedin-lifecycle-retry-v1")
         self.assertEqual(rp.NAUKRI_LIFECYCLE_RETRY.policy_id, "naukri-lifecycle-retry-v1")
         self.assertEqual(rp.INDEED_LIFECYCLE_RETRY.policy_id, "indeed-lifecycle-retry-v1")
+        self.assertEqual(rp.GREENHOUSE_LIFECYCLE_RETRY.policy_id, "greenhouse-lifecycle-retry-v1")
 
     def test_caller_mutable_status_set_is_detached(self) -> None:
         codes = {429, 503}

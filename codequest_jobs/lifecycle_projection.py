@@ -126,10 +126,10 @@ class LifecycleProjection:
 
 
 def default_authority_policy() -> LifecycleAuthorityPolicy:
-    """Production-style default: LinkedIn, Naukri, and Indeed share one canonical class.
+    """Production-style default: canonical lifecycle providers share one authority class.
 
     Injected and unknown providers are omitted (non-authoritative). No relative ranking
-    among the three supported providers is invented.
+    among supported providers is invented.
     """
     ranks = {name: DEFAULT_CANONICAL_AUTHORITY_RANK for name in sorted(SUPPORTED_LIFECYCLE_SOURCES)}
     return LifecycleAuthorityPolicy(DEFAULT_AUTHORITY_POLICY_ID, ranks)

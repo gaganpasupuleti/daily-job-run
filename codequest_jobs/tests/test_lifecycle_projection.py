@@ -119,7 +119,7 @@ class AuthorityPolicyTests(unittest.TestCase):
     def test_default_policy_has_no_provider_ranking(self) -> None:
         policy = default_authority_policy()
         self.assertEqual(policy.policy_id, DEFAULT_AUTHORITY_POLICY_ID)
-        ranks = {policy.authority_rank(name) for name in ("linkedin", "naukri", "indeed")}
+        ranks = {policy.authority_rank(name) for name in ("greenhouse", "linkedin", "naukri", "indeed")}
         self.assertEqual(ranks, {100})
         self.assertFalse(policy.is_authoritative("injected"))
         self.assertFalse(policy.is_authoritative("foundit"))
@@ -161,6 +161,15 @@ class AuthorityPolicyImmutabilityTests(unittest.TestCase):
         after = project_lifecycle(items, policy=policy)
         self.assertEqual(before, after)
 
+    def test_greenhouse_shares_canonical_authority_with_linkedin(self) -> None:
+        policy = default_authority_policy()
+        self.assertTrue(policy.is_authoritative("greenhouse"))
+        linkedin_open = _obs("li", "confirmed_active", T10, provider="linkedin")
+        greenhouse_closed = _obs("gh", "confirmed_expired", T11, provider="greenhouse")
+        result = project_lifecycle([linkedin_open, greenhouse_closed])
+        self.assertEqual(result.decision, UNRESOLVED)
+        self.assertTrue(result.review_required)
+
     def test_default_policy_ranks_cannot_be_mutated(self) -> None:
         policy = default_authority_policy()
         for provider in ("injected", "foundit", "google", "unknown-provider"):
@@ -171,7 +180,7 @@ class AuthorityPolicyImmutabilityTests(unittest.TestCase):
         self.assertFalse(policy.is_authoritative("google"))
         self.assertFalse(policy.is_authoritative("unknown-provider"))
         self.assertEqual(
-            {policy.authority_rank(name) for name in ("linkedin", "naukri", "indeed")},
+            {policy.authority_rank(name) for name in ("greenhouse", "linkedin", "naukri", "indeed")},
             {100},
         )
 

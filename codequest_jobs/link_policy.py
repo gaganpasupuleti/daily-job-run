@@ -21,7 +21,7 @@ SUPPORTED = "supported"
 UNSUPPORTED = "unsupported"
 UNSUPPORTED_SOURCE = "unsupported_source"
 # Sources with a provider lifecycle probe in jobready_validator.default_probes().
-SUPPORTED_LIFECYCLE_SOURCES = frozenset({"indeed", "linkedin", "naukri"})
+SUPPORTED_LIFECYCLE_SOURCES = frozenset({"greenhouse", "indeed", "linkedin", "naukri"})
 # Characters stripped from both ends of a source: ASCII space, \t, \n, \v, \f, \r.
 SOURCE_TRIM_CHARS = " \t\n\x0b\x0c\r"
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
