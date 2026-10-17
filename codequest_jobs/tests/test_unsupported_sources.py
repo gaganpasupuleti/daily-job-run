@@ -510,7 +510,7 @@ class DailyUnsupportedTests(_CatalogFixture):
         self.assertEqual(
             report["validation_reasons"], {"confirmed_active:fixture_open": 4, "inconclusive:naukri_http_500": 4}
         )
-        self.assertEqual(report["validation_supported_sources"], ["indeed", "linkedin", "naukri"])
+        self.assertEqual(report["validation_supported_sources"], ["greenhouse", "indeed", "linkedin", "naukri"])
         self.assertEqual(report["catalog_supported_rows"], 8)
         self.assertEqual(report["catalog_unsupported_rows"], 8)
         self.assertEqual(report["catalog_unsupported_by_source"], {"foundit": 4, "google": 4})
