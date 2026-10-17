@@ -66,20 +66,27 @@ def _gh_jid_identity(gh_vals: list[str]) -> tuple[str | None, str | None]:
     """Resolve all gh_jid values to one id, or return a conflict reason."""
     if not gh_vals:
         return None, None
-    resolved: set[str] = set()
+    valid_ids: set[str] = set()
+    saw_blank = False
+    saw_invalid_nonempty = False
     for raw in gh_vals:
-        text = (raw or "").strip()
-        if not text:
+        if raw is None or raw == "" or not str(raw).strip():
+            saw_blank = True
             continue
-        post_id = _positive_post_id(text)
+        post_id = _positive_post_id(str(raw).strip())
         if post_id is None:
-            return None, "greenhouse_identity_conflict"
-        resolved.add(post_id)
-    if not resolved:
+            saw_invalid_nonempty = True
+        else:
+            valid_ids.add(post_id)
+    if saw_invalid_nonempty and not valid_ids:
         return None, None
-    if len(resolved) > 1:
+    if saw_invalid_nonempty or (saw_blank and valid_ids):
         return None, "greenhouse_identity_conflict"
-    return next(iter(resolved)), None
+    if len(valid_ids) > 1:
+        return None, "greenhouse_identity_conflict"
+    if len(valid_ids) == 1:
+        return next(iter(valid_ids)), None
+    return None, None
 
 
 def greenhouse_job_post_id_from_url(url: str) -> tuple[str | None, str | None]:
@@ -96,7 +103,7 @@ def greenhouse_job_post_id_from_url(url: str) -> tuple[str | None, str | None]:
         match = _JOBS_PATH_RE.search(parsed.path or "")
         if match:
             path_id = _positive_post_id(match.group(1))
-    qs = parse_qs(parsed.query)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
     query_id, query_conflict = _gh_jid_identity(qs.get("gh_jid") or [])
     if query_conflict:
         return None, query_conflict
@@ -111,23 +118,31 @@ def greenhouse_job_post_id_from_url(url: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _credentials_present() -> bool:
-    return bool((os.getenv(ENV_CLIENT_ID) or "").strip() and (os.getenv(ENV_CLIENT_SECRET) or "").strip())
+@dataclass(frozen=True)
+class _AuthContext:
+    client_id: str
+    client_secret: str
+    normalized_sub: str
 
 
-def _validated_user_id() -> str | None:
-    raw = (os.getenv(ENV_USER_ID) or "").strip()
-    if not raw:
-        return None
-    if not _USER_ID_RE.fullmatch(raw):
-        return None
-    return raw
-
-
-def _token_cache_key() -> tuple[str, str]:
+def _auth_context() -> tuple[_AuthContext | None, str | None]:
+    """Resolve OAuth configuration once. Invalid optional sub is a hard auth failure."""
     client_id = (os.getenv(ENV_CLIENT_ID) or "").strip()
-    sub = _validated_user_id() or ""
-    return (client_id, sub)
+    client_secret = (os.getenv(ENV_CLIENT_SECRET) or "").strip()
+    if not client_id or not client_secret:
+        return None, "greenhouse_auth_missing"
+    raw_sub = os.getenv(ENV_USER_ID)
+    if raw_sub is None or not raw_sub.strip():
+        return _AuthContext(client_id, client_secret, ""), None
+    text = raw_sub.strip()
+    if not _USER_ID_RE.fullmatch(text):
+        return None, "greenhouse_auth_failure"
+    return _AuthContext(client_id, client_secret, text), None
+
+
+def _credentials_present() -> bool:
+    ctx, failure = _auth_context()
+    return ctx is not None and failure is None
 
 
 @dataclass
@@ -146,10 +161,10 @@ def _invalidate_token(state: _TokenState) -> None:
     state.cache_key = None
 
 
-def _token_cache_hit(state: _TokenState, clock: Callable[[], float]) -> bool:
+def _token_cache_hit(state: _TokenState, clock: Callable[[], float], auth: _AuthContext) -> bool:
     if not state.access_token:
         return False
-    if state.cache_key != _token_cache_key():
+    if state.cache_key != (auth.client_id, auth.normalized_sub):
         return False
     return clock() < state.expires_at
 
@@ -176,28 +191,24 @@ def fetch_access_token(
     sleep_fn: Callable[[float], None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Return (bearer token, failure reason). Uses in-memory cache when token_state is provided."""
-    if not _credentials_present():
-        return None, "greenhouse_auth_missing"
+    auth, failure = _auth_context()
+    if failure is not None or auth is None:
+        return None, failure or "greenhouse_auth_failure"
     clock = now if now is not None else PRODUCTION_CLOCK
     state = token_state if token_state is not None else _module_token_state
-    if _token_cache_hit(state, clock):
+    if _token_cache_hit(state, clock, auth):
         return state.access_token, None
 
-    client_id = (os.getenv(ENV_CLIENT_ID) or "").strip()
-    client_secret = (os.getenv(ENV_CLIENT_SECRET) or "").strip()
     body: dict[str, str] = {"grant_type": "client_credentials"}
-    sub = _validated_user_id()
-    if sub is not None:
-        body["sub"] = sub
-    elif (os.getenv(ENV_USER_ID) or "").strip():
-        return None, "greenhouse_auth_failure"
+    if auth.normalized_sub:
+        body["sub"] = auth.normalized_sub
 
     def _post_token() -> httpx.Response:
         return client.post(
             GREENHOUSE_TOKEN_URL,
             data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            auth=(client_id, client_secret),
+            auth=(auth.client_id, auth.client_secret),
         )
 
     try:
@@ -221,7 +232,7 @@ def fetch_access_token(
         return None, "greenhouse_auth_failure"
     state.access_token = token
     state.expires_at = clock() + expires_in
-    state.cache_key = _token_cache_key()
+    state.cache_key = (auth.client_id, auth.normalized_sub)
     return token, None
 
 

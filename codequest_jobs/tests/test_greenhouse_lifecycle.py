@@ -382,6 +382,32 @@ class GreenhouseGhJidTests(unittest.TestCase):
         url = "https://boards.greenhouse.io/acme/jobs/5?gh_jid=5&gh_jid=6"
         self.assertEqual(gh.greenhouse_job_post_id_from_url(url), (None, "greenhouse_identity_conflict"))
 
+    def test_valid_plus_blank_gh_jid_conflict(self) -> None:
+        url = "https://boards.greenhouse.io/acme?gh_jid=5&gh_jid="
+        self.assertEqual(gh.greenhouse_job_post_id_from_url(url), (None, "greenhouse_identity_conflict"))
+
+    def test_valid_plus_malformed_gh_jid_conflict(self) -> None:
+        url = "https://boards.greenhouse.io/acme?gh_jid=5&gh_jid=abc"
+        self.assertEqual(gh.greenhouse_job_post_id_from_url(url), (None, "greenhouse_identity_conflict"))
+
+    def test_path_with_blank_duplicate_gh_jid_conflict(self) -> None:
+        url = "https://boards.greenhouse.io/acme/jobs/5?gh_jid=5&gh_jid="
+        self.assertEqual(gh.greenhouse_job_post_id_from_url(url), (None, "greenhouse_identity_conflict"))
+
+    def test_single_blank_gh_jid_no_identity(self) -> None:
+        url = "https://boards.greenhouse.io/acme?gh_jid="
+        self.assertEqual(gh.greenhouse_job_post_id_from_url(url), (None, None))
+
+    def test_mixed_malformed_conflict_no_http(self) -> None:
+        row = {
+            **GREENHOUSE_ROW,
+            "job_url": "https://boards.greenhouse.io/acme?gh_jid=5&gh_jid=",
+        }
+        with patch.object(jobready_validator.httpx, "Client") as mock_client:
+            result = probe_greenhouse(row)
+        mock_client.assert_not_called()
+        self.assertEqual(result.reason, "greenhouse_identity_conflict")
+
 
 class GreenhouseTokenCacheTests(GreenhouseTestBase):
     def test_production_clock_is_monotonic(self) -> None:
@@ -443,12 +469,82 @@ class GreenhouseTokenCacheTests(GreenhouseTestBase):
             calls += 1
             return httpx.Response(200, json=_token_json(3600), request=request)
 
-        with patch.dict(os.environ, FAKE_ENV, clear=False):
+        env = dict(FAKE_ENV)
+        with patch.dict(os.environ, env, clear=False):
             with httpx.Client(transport=httpx.MockTransport(handler)) as client:
                 gh.fetch_access_token(client, token_state=state, now=lambda: clock["t"])
-                os.environ[gh.ENV_CLIENT_ID] = "other-client"
-                gh.fetch_access_token(client, token_state=state, now=lambda: clock["t"])
+                with patch.dict(os.environ, {gh.ENV_CLIENT_ID: "other-client"}, clear=False):
+                    gh.fetch_access_token(client, token_state=state, now=lambda: clock["t"])
         self.assertEqual(calls, 2)
+
+    def test_valid_sub_cache_reuse(self) -> None:
+        state = gh._TokenState()
+        calls = 0
+        env = {**FAKE_ENV, gh.ENV_USER_ID: "99"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json=_token_json(3600), request=request)
+
+        with patch.dict(os.environ, env, clear=False):
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                gh.fetch_access_token(client, token_state=state, now=lambda: 0.0)
+                gh.fetch_access_token(client, token_state=state, now=lambda: 1.0)
+        self.assertEqual(calls, 1)
+
+    def test_changed_valid_sub_refetches(self) -> None:
+        state = gh._TokenState()
+        calls = 0
+        env = {**FAKE_ENV, gh.ENV_USER_ID: "99"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json=_token_json(3600), request=request)
+
+        with patch.dict(os.environ, env, clear=False):
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                gh.fetch_access_token(client, token_state=state, now=lambda: 0.0)
+                with patch.dict(os.environ, {gh.ENV_USER_ID: "100"}, clear=False):
+                    gh.fetch_access_token(client, token_state=state, now=lambda: 1.0)
+        self.assertEqual(calls, 2)
+
+    def test_invalid_sub_after_cached_no_sub_token(self) -> None:
+        state = gh._TokenState()
+        state.access_token = "stale-token"
+        state.expires_at = 99999.0
+        state.cache_key = (FAKE_ENV[gh.ENV_CLIENT_ID], "")
+        http_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal http_calls
+            http_calls += 1
+            return httpx.Response(200, json=_token_json(), request=request)
+
+        with patch.dict(os.environ, FAKE_ENV, clear=False):
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                token, reason = gh.fetch_access_token(client, token_state=state, now=lambda: 0.0)
+                with patch.dict(os.environ, {gh.ENV_USER_ID: "not-numeric"}, clear=False):
+                    token2, reason2 = gh.fetch_access_token(client, token_state=state, now=lambda: 0.0)
+        self.assertEqual((token, reason), ("stale-token", None))
+        self.assertEqual((token2, reason2), (None, "greenhouse_auth_failure"))
+        self.assertEqual(http_calls, 0)
+
+    def test_invalid_sub_empty_cache_no_http(self) -> None:
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json=_token_json(), request=request)
+
+        env = {**FAKE_ENV, gh.ENV_USER_ID: "bad-sub"}
+        with patch.dict(os.environ, env, clear=False):
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                token, reason = gh.fetch_access_token(client, token_state=gh._TokenState(), now=lambda: 0.0)
+        self.assertEqual((token, reason), (None, "greenhouse_auth_failure"))
+        self.assertEqual(calls, 0)
 
     def test_harvest_401_clears_cache_for_retry(self) -> None:
         state = gh._TokenState()
