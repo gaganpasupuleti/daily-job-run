@@ -18,12 +18,10 @@ for _entry in (str(SCRAPER), str(ROOT)):
 
 import httpx  # noqa: E402
 import indeed_checker  # noqa: E402
-import jobready_validator  # noqa: E402
-import naukri_api  # noqa: E402
 import retry_policy  # noqa: E402
 from jobready_validator import probe_indeed, probe_linkedin, probe_naukri, validate_candidates  # noqa: E402
 from link_policy import CONFIRMED_EXPIRED, INCONCLUSIVE  # noqa: E402
-from test_validation_evidence import JOB_ID, linkedin_page  # noqa: E402
+from test_validation_evidence import linkedin_page  # noqa: E402
 from test_validation_provenance import (  # noqa: E402
     INDEED_ROW,
     LINKEDIN_ROW,
