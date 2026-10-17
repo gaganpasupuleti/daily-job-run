@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -74,6 +75,59 @@ class LifecycleRetryPolicyTests(unittest.TestCase):
         self.assertEqual(rp.LINKEDIN_LIFECYCLE_RETRY.policy_id, "linkedin-lifecycle-retry-v1")
         self.assertEqual(rp.NAUKRI_LIFECYCLE_RETRY.policy_id, "naukri-lifecycle-retry-v1")
         self.assertEqual(rp.INDEED_LIFECYCLE_RETRY.policy_id, "indeed-lifecycle-retry-v1")
+
+    def test_caller_mutable_status_set_is_detached(self) -> None:
+        codes = {429, 503}
+        policy = rp.LifecycleRetryPolicy("test", 3, 0.5, 4.0, retryable_status_codes=codes)
+        self.assertIsInstance(policy.retryable_status_codes, frozenset)
+        codes.add(500)
+        self.assertEqual(policy.retryable_status_codes, frozenset({429, 503}))
+
+    def test_mutating_caller_set_after_construction_does_not_alter_policy(self) -> None:
+        codes = {408}
+        policy = rp.LifecycleRetryPolicy("test", 3, 0.5, 4.0, retryable_status_codes=codes)
+        codes.add(429)
+        self.assertEqual(policy.retryable_status_codes, frozenset({408}))
+
+    def test_stored_status_codes_cannot_be_reassigned(self) -> None:
+        policy = rp.LifecycleRetryPolicy("test", 3, 0.5, 4.0)
+        with self.assertRaises(AttributeError):
+            policy.retryable_status_codes = frozenset({500})
+
+    def test_blank_policy_id_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("   ", 3, 0.5, 4.0)
+
+    def test_non_integer_max_attempts_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("test", 1.5, 0.5, 4.0)
+
+    def test_bool_max_attempts_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("test", True, 0.5, 4.0)
+
+    def test_nan_base_delay_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("test", 3, math.nan, 4.0)
+
+    def test_infinite_base_delay_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("test", 3, math.inf, 4.0)
+
+    def test_nan_max_delay_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("test", 3, 0.5, math.nan)
+
+    def test_infinite_max_delay_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            rp.LifecycleRetryPolicy("test", 3, 0.5, math.inf)
+
+    def test_default_provider_policies_unchanged(self) -> None:
+        for policy in (rp.LINKEDIN_LIFECYCLE_RETRY, rp.NAUKRI_LIFECYCLE_RETRY, rp.INDEED_LIFECYCLE_RETRY):
+            self.assertEqual(policy.max_attempts, 3)
+            self.assertEqual(policy.base_delay_seconds, 0.5)
+            self.assertEqual(policy.max_delay_seconds, 4.0)
+            self.assertEqual(policy.retryable_status_codes, rp.DEFAULT_RETRYABLE_STATUS_CODES)
 
 
 class ExecuteWithRetryTests(unittest.TestCase):

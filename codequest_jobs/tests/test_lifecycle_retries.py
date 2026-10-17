@@ -18,6 +18,7 @@ for _entry in (str(SCRAPER), str(ROOT)):
 
 import httpx  # noqa: E402
 import indeed_checker  # noqa: E402
+import jobready_validator  # noqa: E402
 import retry_policy  # noqa: E402
 from jobready_validator import probe_indeed, probe_linkedin, probe_naukri, validate_candidates  # noqa: E402
 from link_policy import CONFIRMED_EXPIRED, INCONCLUSIVE  # noqa: E402
@@ -214,6 +215,42 @@ class LifecycleRetryProviderTests(unittest.TestCase):
 
     def test_linkedin_uses_linkedin_policy_constant(self) -> None:
         self.assertEqual(retry_policy.LINKEDIN_LIFECYCLE_RETRY.policy_id, "linkedin-lifecycle-retry-v1")
+
+    def test_linkedin_proxy_error_is_inconclusive_connection_failure(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ProxyError("proxy failed", request=request)
+
+        requests, patcher = _linkedin_transport(handler)
+        with patcher:
+            result = probe_linkedin(LINKEDIN_ROW)
+        self.assertEqual((result.observation, result.reason), (INCONCLUSIVE, "linkedin_connection_failure"))
+        self.assertNotEqual(result.observation, CONFIRMED_EXPIRED)
+
+    def test_linkedin_local_protocol_error_is_inconclusive(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.LocalProtocolError("local protocol error", request=request)
+
+        requests, patcher = _linkedin_transport(handler)
+        with patcher:
+            result = probe_linkedin(LINKEDIN_ROW)
+        self.assertEqual(result.observation, INCONCLUSIVE)
+        self.assertNotEqual(result.observation, CONFIRMED_EXPIRED)
+
+    def test_linkedin_type_error_propagates(self) -> None:
+        real_client = httpx.Client
+
+        def client(*args, **kwargs):
+            instance = real_client(*args, transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)), **kwargs)
+
+            def broken_get(*_args, **_kwargs):
+                raise TypeError("programming")
+
+            instance.get = broken_get  # type: ignore[method-assign]
+            return instance
+
+        with patch.object(jobready_validator.httpx, "Client", client):
+            with self.assertRaises(TypeError):
+                probe_linkedin(LINKEDIN_ROW)
 
 
 if __name__ == "__main__":

@@ -591,11 +591,17 @@ def probe_linkedin(row: dict[str, Any]) -> ProbeResult:
     if not job_id:
         return ProbeResult(INCONCLUSIVE, "linkedin_unrecognized_url", "linkedin")
     endpoint = GUEST_URL.format(job_id=job_id)
-    with httpx.Client(timeout=8.0, follow_redirects=True, headers=HEADERS) as client:
-        response, transport_error = execute_http_with_retry(
-            lambda: client.get(endpoint),
-            LINKEDIN_LIFECYCLE_RETRY,
+    try:
+        with httpx.Client(timeout=8.0, follow_redirects=True, headers=HEADERS) as client:
+            response, transport_error = execute_http_with_retry(
+                lambda: client.get(endpoint),
+                LINKEDIN_LIFECYCLE_RETRY,
+            )
+    except httpx.HTTPError:
+        observation, reason = interpret_linkedin(
+            status_code=None, body=None, expected_job_id=job_id, final_url=None, error="connection"
         )
+        return ProbeResult(observation, reason, "linkedin", requested_url=endpoint, expected_identity=job_id)
     if transport_error is not None or response is None:
         observation, reason = interpret_linkedin(
             status_code=None, body=None, expected_job_id=job_id, final_url=None, error="connection"

@@ -5,6 +5,7 @@ Retry logic is transport-only: it does not interpret open/closed semantics.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -27,6 +28,25 @@ RETRYABLE_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
 DEFAULT_RETRYABLE_STATUS_CODES = frozenset({408, 429}) | frozenset(range(500, 600))
 
 
+def _validate_policy_id(policy_id: str) -> None:
+    if not isinstance(policy_id, str) or not policy_id.strip():
+        raise ValueError("policy_id must be a non-empty non-whitespace string")
+
+
+def _validate_max_attempts(max_attempts: int) -> None:
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+        raise ValueError("max_attempts must be an integer >= 1")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+
+def _validate_delay(name: str, value: float) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number >= 0")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number >= 0")
+
+
 @dataclass(frozen=True)
 class LifecycleRetryPolicy:
     """Immutable retry policy. max_attempts counts the initial request plus retries."""
@@ -38,12 +58,11 @@ class LifecycleRetryPolicy:
     retryable_status_codes: frozenset[int] = DEFAULT_RETRYABLE_STATUS_CODES
 
     def __post_init__(self) -> None:
-        if self.max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
-        if self.base_delay_seconds < 0 or self.max_delay_seconds < 0:
-            raise ValueError("delays must be non-negative")
-        if not self.policy_id:
-            raise ValueError("policy_id is required")
+        _validate_policy_id(self.policy_id)
+        _validate_max_attempts(self.max_attempts)
+        _validate_delay("base_delay_seconds", self.base_delay_seconds)
+        _validate_delay("max_delay_seconds", self.max_delay_seconds)
+        object.__setattr__(self, "retryable_status_codes", frozenset(self.retryable_status_codes))
 
 
 LINKEDIN_LIFECYCLE_RETRY = LifecycleRetryPolicy(
