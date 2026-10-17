@@ -164,10 +164,10 @@ class AuthorityPolicyImmutabilityTests(unittest.TestCase):
     def test_greenhouse_shares_canonical_authority_with_linkedin(self) -> None:
         policy = default_authority_policy()
         self.assertTrue(policy.is_authoritative("greenhouse"))
-        linkedin_open = _obs("li", "confirmed_active", T10, provider="linkedin")
+        linkedin_open = _obs("li", "confirmed_active", T11, provider="linkedin")
         greenhouse_closed = _obs("gh", "confirmed_expired", T11, provider="greenhouse")
         result = project_lifecycle([linkedin_open, greenhouse_closed])
-        self.assertEqual(result.decision, UNRESOLVED)
+        self.assertEqual((result.decision, result.reason), (UNRESOLVED, REASON_EQUAL_TIME_CONFLICT))
         self.assertTrue(result.review_required)
 
     def test_default_policy_ranks_cannot_be_mutated(self) -> None:
