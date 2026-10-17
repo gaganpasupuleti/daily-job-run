@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +21,8 @@ HARVEST_JOB_POSTS_URL = "https://harvest.greenhouse.io/v3/job_posts"
 ENV_CLIENT_ID = "GREENHOUSE_HARVEST_CLIENT_ID"
 ENV_CLIENT_SECRET = "GREENHOUSE_HARVEST_CLIENT_SECRET"
 ENV_USER_ID = "GREENHOUSE_HARVEST_USER_ID"
+
+PRODUCTION_CLOCK = time.monotonic
 
 _BOARD_HOSTS = frozenset({"boards.greenhouse.io", "job-boards.greenhouse.io"})
 _JOBS_PATH_RE = re.compile(r"/jobs/(\d+)(?:/)?$", re.IGNORECASE)
@@ -58,6 +62,26 @@ def _strict_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _gh_jid_identity(gh_vals: list[str]) -> tuple[str | None, str | None]:
+    """Resolve all gh_jid values to one id, or return a conflict reason."""
+    if not gh_vals:
+        return None, None
+    resolved: set[str] = set()
+    for raw in gh_vals:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        post_id = _positive_post_id(text)
+        if post_id is None:
+            return None, "greenhouse_identity_conflict"
+        resolved.add(post_id)
+    if not resolved:
+        return None, None
+    if len(resolved) > 1:
+        return None, "greenhouse_identity_conflict"
+    return next(iter(resolved)), None
+
+
 def greenhouse_job_post_id_from_url(url: str) -> tuple[str | None, str | None]:
     """Parse a catalog URL to a Harvest job-post id, or (None, conflict_reason)."""
     if not url:
@@ -73,8 +97,9 @@ def greenhouse_job_post_id_from_url(url: str) -> tuple[str | None, str | None]:
         if match:
             path_id = _positive_post_id(match.group(1))
     qs = parse_qs(parsed.query)
-    gh_vals = qs.get("gh_jid") or []
-    query_id = _positive_post_id(gh_vals[0].strip()) if gh_vals and gh_vals[0] else None
+    query_id, query_conflict = _gh_jid_identity(qs.get("gh_jid") or [])
+    if query_conflict:
+        return None, query_conflict
     if host.endswith(".greenhouse.io") or host == "greenhouse.io":
         if path_id and query_id and path_id != query_id:
             return None, "greenhouse_identity_conflict"
@@ -99,13 +124,34 @@ def _validated_user_id() -> str | None:
     return raw
 
 
+def _token_cache_key() -> tuple[str, str]:
+    client_id = (os.getenv(ENV_CLIENT_ID) or "").strip()
+    sub = _validated_user_id() or ""
+    return (client_id, sub)
+
+
 @dataclass
 class _TokenState:
     access_token: str | None = None
     expires_at: float = 0.0
+    cache_key: tuple[str, str] | None = None
 
 
 _module_token_state = _TokenState()
+
+
+def _invalidate_token(state: _TokenState) -> None:
+    state.access_token = None
+    state.expires_at = 0.0
+    state.cache_key = None
+
+
+def _token_cache_hit(state: _TokenState, clock: Callable[[], float]) -> bool:
+    if not state.access_token:
+        return False
+    if state.cache_key != _token_cache_key():
+        return False
+    return clock() < state.expires_at
 
 
 def _parse_token_payload(payload: object) -> tuple[str | None, float | None]:
@@ -117,7 +163,7 @@ def _parse_token_payload(payload: object) -> tuple[str | None, float | None]:
     expires_in = payload.get("expires_in")
     if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)):
         return None, None
-    if expires_in <= 0:
+    if not math.isfinite(expires_in) or expires_in <= 0:
         return None, None
     return token.strip(), float(expires_in)
 
@@ -126,14 +172,15 @@ def fetch_access_token(
     client: httpx.Client,
     *,
     token_state: _TokenState | None = None,
-    now: Callable[[], float] = lambda: 0.0,
+    now: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Return (bearer token, failure reason). Uses in-memory cache when token_state is provided."""
     if not _credentials_present():
         return None, "greenhouse_auth_missing"
+    clock = now if now is not None else PRODUCTION_CLOCK
     state = token_state if token_state is not None else _module_token_state
-    if state.access_token and now() < state.expires_at:
+    if _token_cache_hit(state, clock):
         return state.access_token, None
 
     client_id = (os.getenv(ENV_CLIENT_ID) or "").strip()
@@ -173,7 +220,8 @@ def fetch_access_token(
     if token is None or expires_in is None:
         return None, "greenhouse_auth_failure"
     state.access_token = token
-    state.expires_at = now() + expires_in
+    state.expires_at = clock() + expires_in
+    state.cache_key = _token_cache_key()
     return token, None
 
 
@@ -191,21 +239,23 @@ def _observed_ids(posts: list[dict[str, Any]]) -> tuple[str, ...]:
     return tuple(sorted(set(ids)))
 
 
-def _interpret_matched_post(post: dict[str, Any], expected_id: str) -> tuple[str, str] | None:
+def _interpret_matched_post(post: dict[str, Any], *, query_active: bool) -> tuple[str, str]:
     active = _strict_bool(post.get("active"))
     live = _strict_bool(post.get("live"))
     internal = _strict_bool(post.get("internal"))
     if active is None or live is None or internal is None:
         return INCONCLUSIVE, "greenhouse_invalid_response"
-    if internal:
-        return INCONCLUSIVE, "greenhouse_internal_post"
-    if active and live:
-        return CONFIRMED_ACTIVE, "greenhouse_post_live"
-    if active and not live:
+    if query_active:
+        if active is not True:
+            return INCONCLUSIVE, "greenhouse_invalid_response"
+        if internal:
+            return INCONCLUSIVE, "greenhouse_internal_post"
+        if live:
+            return CONFIRMED_ACTIVE, "greenhouse_post_live"
         return CONFIRMED_EXPIRED, "greenhouse_post_offline"
-    if not active:
-        return CONFIRMED_EXPIRED, "greenhouse_post_deleted"
-    return INCONCLUSIVE, "greenhouse_invalid_response"
+    if active is not False:
+        return INCONCLUSIVE, "greenhouse_invalid_response"
+    return CONFIRMED_EXPIRED, "greenhouse_post_deleted"
 
 
 def _select_expected_post(posts: list[dict[str, Any]], expected_id: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -238,6 +288,7 @@ def interpret_harvest_job_posts(
     expected_id: str,
     requested_url: str,
     final_url: str | None,
+    query_active: bool,
     error: str | None = None,
 ) -> GreenhouseEvidence:
     if error or status_code is None:
@@ -319,17 +370,7 @@ def interpret_harvest_job_posts(
             http_status=status_code,
             observed_identities=(),
         )
-    verdict = _interpret_matched_post(matched, expected_id)
-    if verdict is None:
-        return GreenhouseEvidence(
-            INCONCLUSIVE,
-            "greenhouse_invalid_response",
-            requested_url=requested_url,
-            final_url=final_url,
-            http_status=status_code,
-            observed_identities=observed,
-        )
-    observation, reason = verdict
+    observation, reason = _interpret_matched_post(matched, query_active=query_active)
     return GreenhouseEvidence(
         observation,
         reason,
@@ -337,6 +378,27 @@ def interpret_harvest_job_posts(
         final_url=final_url,
         http_status=status_code,
         observed_identities=observed,
+    )
+
+
+def _harvest_evidence(
+    response: httpx.Response,
+    *,
+    body: object,
+    post_id: str,
+    requested_url: str,
+    query_active: bool,
+    token_state: _TokenState,
+) -> GreenhouseEvidence:
+    if response.status_code == 401:
+        _invalidate_token(token_state)
+    return interpret_harvest_job_posts(
+        status_code=response.status_code,
+        body=body,
+        expected_id=post_id,
+        requested_url=requested_url,
+        final_url=str(response.url),
+        query_active=query_active,
     )
 
 
@@ -348,7 +410,9 @@ def lookup_greenhouse_lifecycle(
     now: Callable[[], float] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> GreenhouseEvidence:
-    token, auth_reason = fetch_access_token(client, token_state=token_state, now=now or (lambda: 0.0), sleep_fn=sleep_fn)
+    clock = now if now is not None else PRODUCTION_CLOCK
+    state = token_state if token_state is not None else _module_token_state
+    token, auth_reason = fetch_access_token(client, token_state=state, now=clock, sleep_fn=sleep_fn)
     if token is None:
         return GreenhouseEvidence(INCONCLUSIVE, auth_reason or "greenhouse_auth_failure")
 
@@ -369,12 +433,13 @@ def lookup_greenhouse_lifecycle(
         active_body = active_resp.json()
     except ValueError:
         active_body = None
-    active_evidence = interpret_harvest_job_posts(
-        status_code=active_resp.status_code,
+    active_evidence = _harvest_evidence(
+        active_resp,
         body=active_body,
-        expected_id=post_id,
+        post_id=post_id,
         requested_url=active_url,
-        final_url=str(active_resp.url),
+        query_active=True,
+        token_state=state,
     )
     if active_evidence.reason != "greenhouse_post_not_found":
         return active_evidence
@@ -384,7 +449,9 @@ def lookup_greenhouse_lifecycle(
 
     inactive_url = _job_posts_request_url(post_id, active=False)
     try:
-        inactive_resp, inactive_transport = execute_http_with_retry(_get_inactive, GREENHOUSE_LIFECYCLE_RETRY, sleep_fn=sleep_fn)
+        inactive_resp, inactive_transport = execute_http_with_retry(
+            _get_inactive, GREENHOUSE_LIFECYCLE_RETRY, sleep_fn=sleep_fn
+        )
     except httpx.HTTPError:
         return GreenhouseEvidence(INCONCLUSIVE, "greenhouse_connection_failure", requested_url=inactive_url)
     if inactive_transport is not None or inactive_resp is None:
@@ -393,10 +460,11 @@ def lookup_greenhouse_lifecycle(
         inactive_body = inactive_resp.json()
     except ValueError:
         inactive_body = None
-    return interpret_harvest_job_posts(
-        status_code=inactive_resp.status_code,
+    return _harvest_evidence(
+        inactive_resp,
         body=inactive_body,
-        expected_id=post_id,
+        post_id=post_id,
         requested_url=inactive_url,
-        final_url=str(inactive_resp.url),
+        query_active=False,
+        token_state=state,
     )
