@@ -33,6 +33,7 @@ import indeed_checker  # noqa: E402
 import jobready_catalog as catalog  # noqa: E402
 import jobready_validator  # noqa: E402
 import naukri_api  # noqa: E402
+import retry_policy  # noqa: E402
 import run_jobready_daily as daily  # noqa: E402
 from jobready_validator import (  # noqa: E402
     JOBREADY_EVIDENCE_VERSION,
@@ -301,7 +302,8 @@ class LinkedInProvenanceTests(unittest.TestCase):
     def test_connection_failure(self) -> None:
         result, requests = self._probe(_refuse)
         self.assertEqual((result.observation, result.reason), ("inconclusive", "linkedin_connection_failure"))
-        self.assertEqual(requests.urls, [GUEST])
+        self.assertEqual(len(requests.urls), retry_policy.LINKEDIN_LIFECYCLE_RETRY.max_attempts)
+        self.assertTrue(all(url == GUEST for url in requests.urls))
         self.assertEqual(_provenance(result), (GUEST, None, None))
 
     def test_unrecognized_url_makes_no_request(self) -> None:
@@ -358,7 +360,7 @@ class NaukriProvenanceTests(unittest.TestCase):
     def test_connection_failure(self) -> None:
         result, requests = self._probe(_refuse)
         self.assertEqual((result.observation, result.reason), ("inconclusive", "naukri_connection_failure"))
-        self.assertEqual(len(requests.urls), 1)
+        self.assertEqual(len(requests.urls), retry_policy.NAUKRI_LIFECYCLE_RETRY.max_attempts)
         self.assertEqual(_provenance(result), (NAUKRI_ENDPOINT, None, None))
 
     def test_failed_warm_up_never_issued_the_detail_request(self) -> None:
