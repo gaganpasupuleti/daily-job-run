@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html><body>
+<script>
+setTimeout(() => {
+  const root = document.createElement('div');
+  root.id = 'job-validation-root';
+  root.setAttribute('data-expected-job-id', 'job-1003');
+  root.setAttribute('data-observed-job-id', 'job-1003');
+  root.setAttribute('data-listing-status', 'open');
+  root.setAttribute('data-requisition-status', 'open');
+  root.setAttribute('data-application-route', 'open');
+  document.body.appendChild(root);
+}, 400);
+</script>
+</body></html>
