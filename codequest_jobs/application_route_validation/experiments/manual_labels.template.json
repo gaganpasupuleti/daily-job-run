@@ -1,0 +1,17 @@
+{
+  "instructions": "Human reviewer fills route_ready_label per job_id. Values: confirmed_open, confirmed_closed, unresolved. Do not copy automation output.",
+  "labeled_at": null,
+  "reviewer": null,
+  "jobs": {
+    "CQJ-20261020-14022": null,
+    "CQJ-20261020-14032": null,
+    "CQJ-20261020-16824": null,
+    "CQJ-20261020-2488": null,
+    "CQJ-20261020-1020": null,
+    "CQJ-20261020-1021": null,
+    "CQJ-20261020-1022": null,
+    "CQJ-20261020-10215": null,
+    "CQJ-20261020-10205": null,
+    "CQJ-20261020-10208": null
+  }
+}

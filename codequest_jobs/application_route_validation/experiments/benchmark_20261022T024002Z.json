@@ -1,0 +1,158 @@
+{
+  "run_id": "b630a49f-d3a1-42e7-9318-af1fcc485ea5",
+  "generated_at": "2026-10-22T02:40:02.759579+00:00",
+  "sample_size": 10,
+  "label_coverage": 0,
+  "open_precision": null,
+  "closed_precision": null,
+  "note": "Precision requires manual_labels.json; unresolved is not counted as correct.",
+  "unresolved_rate_http": 1.0,
+  "unresolved_rate_browser": 0.6,
+  "browser_incremental_resolved": 4,
+  "duration_ms_p50": 1049.5,
+  "duration_ms_p95": 2381,
+  "http": [
+    {
+      "job_id": "CQJ-20261020-1020",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 3013
+    },
+    {
+      "job_id": "CQJ-20261020-1021",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 3063
+    },
+    {
+      "job_id": "CQJ-20261020-1022",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 2215
+    },
+    {
+      "job_id": "CQJ-20261020-14022",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    },
+    {
+      "job_id": "CQJ-20261020-14032",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    },
+    {
+      "job_id": "CQJ-20261020-16824",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    },
+    {
+      "job_id": "CQJ-20261020-2488",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    },
+    {
+      "job_id": "CQJ-20261020-10215",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 2175
+    },
+    {
+      "job_id": "CQJ-20261020-10205",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    },
+    {
+      "job_id": "CQJ-20261020-10208",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    }
+  ],
+  "browser": [
+    {
+      "job_id": "CQJ-20261020-1020",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": true,
+      "elapsed_ms": 5302
+    },
+    {
+      "job_id": "CQJ-20261020-1021",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": true,
+      "elapsed_ms": 2381
+    },
+    {
+      "job_id": "CQJ-20261020-1022",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": true,
+      "elapsed_ms": 2349
+    },
+    {
+      "job_id": "CQJ-20261020-14022",
+      "route_ready": "confirmed_open",
+      "application_route_outcome": "confirmed_open",
+      "browser_attempted": true,
+      "elapsed_ms": 806
+    },
+    {
+      "job_id": "CQJ-20261020-14032",
+      "route_ready": "confirmed_open",
+      "application_route_outcome": "confirmed_open",
+      "browser_attempted": true,
+      "elapsed_ms": 712
+    },
+    {
+      "job_id": "CQJ-20261020-16824",
+      "route_ready": "confirmed_open",
+      "application_route_outcome": "confirmed_open",
+      "browser_attempted": true,
+      "elapsed_ms": 688
+    },
+    {
+      "job_id": "CQJ-20261020-2488",
+      "route_ready": "confirmed_open",
+      "application_route_outcome": "confirmed_open",
+      "browser_attempted": true,
+      "elapsed_ms": 1293
+    },
+    {
+      "job_id": "CQJ-20261020-10215",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 2366
+    },
+    {
+      "job_id": "CQJ-20261020-10205",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    },
+    {
+      "job_id": "CQJ-20261020-10208",
+      "route_ready": "unresolved",
+      "application_route_outcome": "unresolved",
+      "browser_attempted": false,
+      "elapsed_ms": 0
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+# Optional deps for application_route_validation prototype only (not production daily run).
+playwright>=1.40
