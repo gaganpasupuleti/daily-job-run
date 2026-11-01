@@ -1,0 +1,72 @@
+# Safe to run in a PUBLIC repository: does not collect jobs or access Railway.
+name: JobReady public pilot (disposable data only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobready-public-pilot
+  cancel-in-progress: false
+
+jobs:
+  synthetic-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # All six URLs point to disposable databases created below.
+      JOBREADY_UI_SYNC_APP_URL: postgresql://postgres:postgres@localhost:5432/jobready_ui_sync_app_test
+      JOBREADY_UI_SYNC_CATALOG_URL: postgresql://postgres:postgres@localhost:5432/jobready_ui_sync_catalog_test
+      JOBREADY_DAILY_CATALOG_URL: postgresql://postgres:postgres@localhost:5432/jobready_daily_catalog
+      JOBREADY_DAILY_APP_URL: postgresql://postgres:postgres@localhost:5432/jobready_daily_app
+      JOBREADY_SENTINEL_CODEQUEST_URL: postgresql://postgres:postgres@localhost:5432/jobready_sentinel_codequest
+      JOBREADY_SENTINEL_SCRAPER_URL: postgresql://postgres:postgres@localhost:5432/jobready_sentinel_scraper
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install existing test dependencies
+        run: pip install -r naukri_jobs_scraper/requirements.txt
+      - name: Create six disposable localhost databases
+        shell: bash
+        run: |
+          python - <<'PY'
+          import psycopg2
+          from psycopg2 import sql
+          databases = (
+              'jobready_ui_sync_app_test', 'jobready_ui_sync_catalog_test',
+              'jobready_daily_catalog', 'jobready_daily_app',
+              'jobready_sentinel_codequest', 'jobready_sentinel_scraper',
+          )
+          conn = psycopg2.connect('postgresql://postgres:postgres@localhost:5432/postgres')
+          conn.autocommit = True
+          with conn.cursor() as cur:
+              for database in databases:
+                  cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(database)))
+          conn.close()
+          print('PILOT_DB_READY count=6 disposable_only=true')
+          PY
+      - name: Run collector and lifecycle integration tests, then print safe counts
+        shell: bash
+        run: python codequest_jobs/public_pilot.py
