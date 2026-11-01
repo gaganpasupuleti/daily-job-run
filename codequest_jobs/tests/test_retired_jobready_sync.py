@@ -264,7 +264,7 @@ class AuditRetiredPruneTests(unittest.TestCase):
         code, output, report = self.run_main(
             [],
             load_env=lambda *_args, **_kwargs: None,
-            fetch_job_ready_rows=lambda: [row],
+            fetch_job_ready_rows=lambda **_kwargs: [row],
             default_probes=lambda: {"naukri": lambda _row: ("confirmed_expired", "test_closed", "test")},
         )
         self.assertEqual(code, 0)

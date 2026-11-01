@@ -200,6 +200,8 @@ def collect_jobs(
         failures = int(row["call_failures"])
         source_health[name] = {
             "attempted": True,
+            "calls": calls,
+            "call_failures": failures,
             "succeeded": calls > 0 and failures < calls,
             "failed": calls == 0 or failures == calls,
             "jobs_returned": int(returned.get(name, 0)),

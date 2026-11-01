@@ -58,7 +58,7 @@ class SafetyTests(unittest.TestCase):
         original_fetch = audit_job_ready.fetch_job_ready_rows
         original_archive = sync.archive_ui_jobs_not_in_catalog
         calls: list[str] = []
-        audit_job_ready.fetch_job_ready_rows = lambda: []
+        audit_job_ready.fetch_job_ready_rows = lambda **_kwargs: []
         sync.archive_ui_jobs_not_in_catalog = lambda **kwargs: calls.append("archive")
         try:
             stdout = io.StringIO()
