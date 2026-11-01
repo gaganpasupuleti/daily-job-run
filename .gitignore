@@ -20,4 +20,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.log
-page_snippet.txt
+benchmark_local_reports/
+**/jobready_live_collection_benchmark.json
+**/jobready_cost_projection.json
+**/job_ready_audit_summary_*.json

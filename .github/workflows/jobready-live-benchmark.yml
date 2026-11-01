@@ -1,0 +1,51 @@
+# Safe bounded live collection benchmark — no production database or publication.
+name: JobReady live collection benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: Comma-separated sources (default naukri,indeed)
+        required: false
+        default: naukri,indeed
+      max_pages:
+        description: Max pages per keyword (cap 5)
+        required: false
+        default: "1"
+      results_wanted:
+        description: Results wanted per query (cap 30)
+        required: false
+        default: "5"
+      family:
+        description: Role family id (repeatable; default python-dev)
+        required: false
+        default: python-dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobready-live-benchmark
+  cancel-in-progress: false
+
+jobs:
+  collect-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BENCHMARK_SOURCES: ${{ inputs.sources }}
+      BENCHMARK_MAX_PAGES: ${{ inputs.max_pages }}
+      BENCHMARK_RESULTS_WANTED: ${{ inputs.results_wanted }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install scraper dependencies
+        run: pip install -r naukri_jobs_scraper/requirements.txt
+      - name: Run bounded live collection benchmark
+        run: python codequest_jobs/live_collection_benchmark.py --family "${{ inputs.family }}"

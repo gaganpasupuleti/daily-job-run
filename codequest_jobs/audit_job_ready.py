@@ -58,11 +58,17 @@ EXIT_RETIRED = 2
 SOURCE_ORDER = {"linkedin": 0, "indeed": 1, "foundit": 2, "naukri": 3}
 CONCLUSIVE = (CONFIRMED_ACTIVE, CONFIRMED_EXPIRED)
 ROW_COLUMNS = ("job_id", "source", "job_url", "apply_url", "link_status")
+MAX_AUDIT_LIMIT = 200
 
 
-def fetch_job_ready_rows() -> list[dict[str, Any]]:
+def fetch_job_ready_rows(
+    *,
+    limit: int | None = None,
+    source_filter: str | None = None,
+    catalog_url: str | None = None,
+) -> list[dict[str, Any]]:
     """Read catalog rows with their stored link_status. The session is read-only."""
-    dest = (os.getenv("JOB_READY_DATABASE_URL") or "").strip()
+    dest = (catalog_url or os.getenv("JOBREADY_AUDIT_READONLY_URL") or os.getenv("JOB_READY_DATABASE_URL") or "").strip()
     if not dest:
         raise SystemExit("APPLY_REFUSED catalog target must be configured")
     try:
@@ -83,7 +89,14 @@ def fetch_job_ready_rows() -> list[dict[str, Any]]:
             rows = [dict(zip(ROW_COLUMNS, raw)) for raw in cur.fetchall()]
     finally:
         conn.close()
+    if source_filter:
+        wanted = source_filter.strip().lower()
+        rows = [row for row in rows if normalize_source(row.get("source")) == wanted]
     rows.sort(key=lambda row: (SOURCE_ORDER.get(normalize_source(row["source"]), 9), row["job_id"]))
+    if limit is not None:
+        if limit < 1 or limit > MAX_AUDIT_LIMIT:
+            raise SystemExit("APPLY_REFUSED audit limit must be between 1 and 200")
+        rows = rows[:limit]
     return rows
 
 
@@ -144,35 +157,33 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Read-only catalog link audit")
-    parser.add_argument(
-        "--prune-job-ready",
-        action="store_true",
-        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; this audit never modifies JobReady.",
-    )
-    parser.add_argument(
-        "--confirm-target",
-        default=None,
-        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; this audit never modifies JobReady.",
-    )
-    args = parser.parse_args(argv)
-    if args.prune_job_ready or args.confirm_target is not None:
-        print(JOBREADY_SYNC_RETIRED, flush=True)
-        print(JOBREADY_SYNC_RETIRED_HELP, flush=True)
-        return EXIT_RETIRED
-    load_env(ENV)
-    print("Read-only audit. The JobReady catalog and application database will not be modified.", flush=True)
+def summarize_by_source(results: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    buckets: dict[str, dict[str, int]] = {}
+    for result in results:
+        source = result["source"]
+        bucket = buckets.setdefault(source, {CONFIRMED_ACTIVE: 0, CONFIRMED_EXPIRED: 0, INCONCLUSIVE: 0, UNSUPPORTED: 0})
+        bucket[result["observation"]] = bucket.get(result["observation"], 0) + 1
+    return {key: dict(sorted(value.items())) for key, value in sorted(buckets.items())}
 
-    rows = fetch_job_ready_rows()
+
+def run_readonly_audit(
+    *,
+    limit: int | None = None,
+    source_filter: str | None = None,
+    counts_only: bool = False,
+    report_dir: str | None = None,
+    write_repo_output: bool = True,
+) -> tuple[dict[str, Any], Path | None]:
+    rows = fetch_job_ready_rows(limit=limit, source_filter=source_filter)
     by_source: dict[str, int] = {}
     for row in rows:
         key = source_label(row["source"])
         by_source[key] = by_source.get(key, 0) + 1
-    print(f"Job-ready availability audit: {len(rows)} links", flush=True)
-    print("by_source:", by_source, flush=True)
-    eta_min = max(1, int(round(len(rows) / 1.4 / 60))) if rows else 0
-    print(f"ETA audit: ~{eta_min} min", flush=True)
+    if not counts_only:
+        print(f"Job-ready availability audit: {len(rows)} links", flush=True)
+        print("by_source:", by_source, flush=True)
+        eta_min = max(1, int(round(len(rows) / 1.4 / 60))) if rows else 0
+        print(f"ETA audit: ~{eta_min} min", flush=True)
 
     probes = default_probes()
     results: list[dict[str, Any]] = []
@@ -183,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         for fut in as_completed(futures):
             result = fut.result()
             results.append(result)
-            if len(results) % 100 == 0:
+            if not counts_only and len(results) % 100 == 0:
                 counts = summarize(results)
                 elapsed = time.time() - t0
                 rate = len(results) / elapsed if elapsed else 0
@@ -200,18 +211,65 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = round(time.time() - t0, 1)
     results.sort(key=lambda result: result["job_id"])
+    checked = summarize(results)["checked"]
     summary = {
         **summarize(results),
         "queued": len(rows),
         "elapsed_sec": elapsed,
         "by_source_queued": by_source,
+        "results_by_source": summarize_by_source(results),
+        "seconds_per_checked_job": round(elapsed / checked, 3) if checked else 0.0,
     }
-    report = {**summary, "results": results}
-    out = ROOT / "output" / f"job_ready_audit_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(summary, indent=2), flush=True)
-    print(f"Report: {out}", flush=True)
+    report_payload = summary if counts_only else {**summary, "results": results}
+    out: Path | None = None
+    if report_dir:
+        out = Path(report_dir) / f"job_ready_audit_summary_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    elif write_repo_output and not counts_only:
+        out = ROOT / "output" / f"job_ready_audit_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({**summary, "results": results}, indent=2), encoding="utf-8")
+    if not counts_only:
+        print(json.dumps(summary, indent=2), flush=True)
+        if out is not None:
+            print(f"Report: {out}", flush=True)
+    return summary, out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Read-only catalog link audit")
+    parser.add_argument(
+        "--prune-job-ready",
+        action="store_true",
+        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; this audit never modifies JobReady.",
+    )
+    parser.add_argument(
+        "--confirm-target",
+        default=None,
+        help="RETIRED. Refused with JOBREADY_SYNC_RETIRED; this audit never modifies JobReady.",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Deterministic cap (max 200) on eligible rows")
+    parser.add_argument("--source", default=None, help="Optional source filter before applying --limit")
+    parser.add_argument("--counts-only", action="store_true", help="Counts-only logging; omit per-row output")
+    args = parser.parse_args(argv)
+    if args.prune_job_ready or args.confirm_target is not None:
+        print(JOBREADY_SYNC_RETIRED, flush=True)
+        print(JOBREADY_SYNC_RETIRED_HELP, flush=True)
+        return EXIT_RETIRED
+    load_env(ENV)
+    print("Read-only audit. The JobReady catalog and application database will not be modified.", flush=True)
+
+    summary, out = run_readonly_audit(
+        limit=args.limit,
+        source_filter=args.source,
+        counts_only=args.counts_only,
+        write_repo_output=not args.counts_only,
+    )
+    if args.counts_only:
+        print(json.dumps({key: summary[key] for key in summary if key != "validation_reasons"}, indent=2), flush=True)
+        if out is not None:
+            print(f"Summary report: {out}", flush=True)
     return 0
 
 
