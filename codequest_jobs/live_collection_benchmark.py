@@ -20,7 +20,9 @@ for _entry in (str(SCRAPER), str(ROOT)):
     sys.path.insert(0, _entry)
 
 from benchmark_isolation import check_public_collection_isolation, redact_urls  # noqa: E402
-from run_all_sources import collect_jobs, dedupe_jobs, parse_sources  # noqa: E402
+from benchmark_reporting import analyze_source_outcomes, is_rate_limit_error  # noqa: E402
+from cost_calculator import PricingAssumptions, github_actions_runtime_estimate, github_cost_usd  # noqa: E402
+from run_all_sources import collect_jobs, dedupe_jobs  # noqa: E402
 
 MAX_PAGES_CAP = 5
 MAX_RESULTS_CAP = 30
@@ -33,7 +35,7 @@ DEFAULT_FAMILY = "python-dev"
 
 def quiet_public_logs() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s", force=True)
-    for name in ("httpx", "httpcore", "urllib3", "run_all_sources", "naukri_api", "jobspy", "JobSpy"):
+    for name in ("httpx", "httpcore", "urllib3", "run_all_sources", "naukri_api", "jobspy", "jobspy_client", "JobSpy", "root"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
@@ -69,30 +71,31 @@ def build_report(
     collection_seconds: float,
     dedupe_seconds: float,
     workflow_started: float,
+    stopped_early: bool = False,
+    stop_reason: str = "",
 ) -> dict:
-    want_naukri, jobspy_sites, want_foundit = parse_sources(sources)
-    completed: list[str] = []
-    if want_naukri:
-        completed.append("naukri")
-    if want_foundit:
-        completed.append("foundit")
-    completed.extend(jobspy_sites)
+    health = scrape_result.source_health or {}
+    outcomes = analyze_source_outcomes(sources, health)
     per_source = dict(scrape_result.per_source)
     source_errors = sanitize_errors(list(scrape_result.errors))
-    health = scrape_result.source_health or {}
-    failure_counts = {
-        name: len(row.get("errors") or []) if isinstance(row, dict) else 0
-        for name, row in health.items()
-    }
+    failure_counts = {name: int((health.get(name) or {}).get("call_failures") or 0) for name in outcomes["sources_requested"]}
     total_runtime = round(time.monotonic() - workflow_started, 2)
     avg_per_job = round(collection_seconds / raw_count, 3) if raw_count else 0.0
+    gh_daily = github_actions_runtime_estimate(total_runtime, runs_per_day=1)
+    gh_monthly = github_actions_runtime_estimate(total_runtime, runs_per_day=1)
+    minutes = gh_monthly["estimated_monthly_runtime_minutes"]
+    pricing = PricingAssumptions()
     return {
         "mode": "live_collection_benchmark",
         "production_database_accessed": False,
         "publication_ran": False,
-        "sources_requested": sources,
+        "sources_requested_csv": sources,
+        "sources_requested": outcomes["sources_requested"],
         "sources_attempted": list(scrape_result.sources_attempted),
-        "sources_completed": completed,
+        "sources_completed": outcomes["sources_completed"],
+        "sources_failed": outcomes["sources_failed"],
+        "sources_zero_results": outcomes["sources_zero_results"],
+        "source_details": outcomes["source_details"],
         "jobs_collected_by_source": per_source,
         "jobs_collected_total_raw": raw_count,
         "jobs_unique_after_dedupe": unique_count,
@@ -105,8 +108,18 @@ def build_report(
         "peak_memory_mb": peak_memory_mb(),
         "average_seconds_per_collected_job": avg_per_job,
         "families_used": family_ids,
+        "family_count": len(family_ids),
         "max_pages": max_pages,
         "results_wanted": results_wanted,
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
+        "github_actions_runtime": gh_daily,
+        "github_actions_cost_assumption_public_usd": github_cost_usd(minutes, private=False, pricing=pricing)[
+            "estimated_extra_usd_assumption"
+        ],
+        "github_actions_cost_assumption_private_usd": github_cost_usd(minutes, private=True, pricing=pricing)[
+            "estimated_extra_usd_assumption"
+        ],
     }
 
 
@@ -114,7 +127,7 @@ def format_public_log_line(report: dict) -> str:
     parts = [
         "BENCH_COLLECT",
         report.get("status", "ok"),
-        f"sources={report['sources_requested']}",
+        f"sources={report.get('sources_requested_csv', report.get('sources_requested'))}",
         f"raw={report['jobs_collected_total_raw']}",
         f"unique={report['jobs_unique_after_dedupe']}",
         f"errors={report['source_error_count']}",

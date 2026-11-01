@@ -35,15 +35,28 @@ def github_cost_usd(minutes: float, *, private: bool, pricing: PricingAssumption
 
 
 def railway_cost_usd(minutes: float, pricing: PricingAssumptions) -> dict:
+    """`minutes` is already total monthly runner minutes (not per-day)."""
     hours = minutes / 60.0
     compute = pricing.railway_vcpu_count * pricing.railway_vcpu_usd_per_hour
     memory = pricing.railway_memory_gb * pricing.railway_memory_gb_usd_per_hour
     hourly = compute + memory
     return {
         "minutes_used": round(minutes, 1),
-        "estimated_usd_assumption": round(hours * hourly * 30, 2) if minutes else 0.0,
+        "estimated_usd_assumption": round(hours * hourly, 2) if minutes else 0.0,
         "hourly_rate_usd_assumption": round(hourly, 6),
         "rates_verified": False,
+    }
+
+
+def github_actions_runtime_estimate(seconds_per_run: float, *, runs_per_day: int = 1) -> dict:
+    daily_seconds = round(seconds_per_run * runs_per_day, 1)
+    monthly_minutes_total = monthly_minutes(runs_per_day, seconds_per_run)
+    return {
+        "seconds_per_run_measured": round(seconds_per_run, 2),
+        "runs_per_day": runs_per_day,
+        "estimated_daily_runtime_seconds": daily_seconds,
+        "estimated_monthly_runtime_minutes": round(monthly_minutes_total, 1),
+        "estimated_monthly_runtime_hours": round(monthly_minutes_total / 60.0, 2),
     }
 
 

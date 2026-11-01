@@ -1,39 +1,76 @@
-# JobReady live benchmark report
+# JobReady full-scale collection benchmark (measured)
 
-Generated during implementation of `feat/jobready-live-benchmark`. Measured metrics are from **bounded local runs** on a developer workstation (Windows, Python 3.12). GitHub Actions runs should be triggered manually from `.github/workflows/jobready-live-benchmark.yml` after merge; billing numbers below use **assumptions** unless noted.
+**Date:** 2026-11-01 (UTC)  
+**Branch:** `feat/jobready-live-benchmark` (PR #28 not merged)  
+**Runner:** Local Windows workstation, Python 3.12 — **not** GitHub Actions  
+**Isolation:** No production DB env vars loaded; no catalog writes, publication, or `--sync-application`
 
-## Scope and safety
+## Parameters (unchanged load)
 
-| Check | Result |
-|-------|--------|
-| Production catalog/database writes | **Not performed** |
-| `--sync-application` / publication | **Not invoked** |
-| Job URLs in benchmark stdout | **Redacted / suppressed** (HTTP request logging raised to WARNING in benchmark runner) |
-| Live validation against production catalog | **Not run** (no verified read-only `JOBREADY_AUDIT_READONLY_URL` in this environment) |
-| Public workflow connects to Postgres/Railway | **No** (see workflow static tests) |
+| Parameter | Value |
+|-----------|--------|
+| Families | All **19** from `naukri_jobs_scraper/families.json` |
+| Sources | `naukri,indeed,linkedin,google,foundit` |
+| `max_pages` | 1 |
+| `results_wanted` | 5 |
+| `hours_old` | 72 |
+| Inter-family pause | 2s |
 
-## Real collection benchmark (Naukri + Indeed)
+Raw job payloads: `benchmark_local_reports/full_scale_jobs_*.json` (gitignored).  
+Sanitized summary JSON: `benchmark_local_reports/full_scale_summary_20261101_141255.json`.
 
-Defaults: `sources=naukri,indeed`, `max_pages=1`, `results_wanted=5`, single family `python-dev`.
+## Measured collection results (this run only)
 
-| Run | Raw collected | Unique after dedupe | Naukri | Indeed | Errors | Collection (s) | Total workflow (s) | Peak memory (MB) |
-|-----|---------------|---------------------|--------|--------|--------|------------------|--------------------|------------------|
-| 1 | 41 | 41 | 31 | 10 | 0 | 13.66 | 13.66 | 45.35 |
-| 2 | 41 | 41 | 31 | 10 | 0 | 9.81 | 9.81 | 45.28 |
+| Metric | Value |
+|--------|--------|
+| Families completed | **19 / 19** |
+| Stopped early | **No** |
+| Raw jobs collected | **716** |
+| Unique after global dedupe | **475** |
+| Collection CPU time | **237.8 s** |
+| Dedupe | **<0.1 s** |
+| Total benchmark runtime | **273.8 s** (~4.6 min) |
+| Peak memory (approx.) | See summary JSON |
 
-**Average time per collected job (raw):** ~0.27s (run 1) and ~0.24s (run 2).
+### Per-source (status distinguishes zero yield vs failed searches)
 
-Detailed JSON reports were written under the local temp directory (`BENCHMARK_LOCAL_REPORT_DIR` / `RUNNER_TEMP`), which is gitignored—not committed.
+| Source | Status | Searches attempted | Search failures | Unique jobs |
+|--------|--------|-------------------:|----------------:|------------:|
+| **naukri** | ok | 39 | 0 | **272** |
+| **indeed** | ok | 39 | 0 | **91** |
+| **linkedin** | ok | 39 | 0 | **112** |
+| **google** | **zero_results** | 39 | 0 | **0** |
+| **foundit** | **zero_results** | 39 | 0 | **0** |
 
-## Validation benchmark (existing catalog rows)
+- **Failed source** (all searches failed): none in this run.
+- **Zero results:** Google and Foundit returned no normalized rows for every family keyword pass (distinct from hard failure).
+- **Rate limiting:** JobSpy logged multiple `429 (blocked: use a proxy)` lines to stderr during the run; LinkedIn/Indeed still returned jobs. Early-stop did not trigger because those 429 messages were not always propagated into collector `errors` (limitation noted below).
 
-**Status: untested (live).**
+## GitHub Actions runtime estimate (from this measured run)
 
-Requirements for a safe run (private environment only):
+Uses `github_actions_runtime_estimate()` on **273.8 s** total workflow time:
 
-1. Configure `JOBREADY_AUDIT_READONLY_URL` (or existing `JOB_READY_DATABASE_URL`) with a **read-only** Postgres role.
-2. Do **not** set `GITHUB_ACTIONS=true` (the wrapper refuses hosted runners).
-3. Run, for example:
+| Schedule | Est. daily runtime | Est. monthly minutes |
+|----------|-------------------:|---------------------:|
+| 1×/day | **273.8 s** | **~136.9 min** |
+| 2×/day | **~547.6 s** | **~273.8 min** |
+
+**Cost assumptions** (`cost_calculator.py`, rates **not verified**):
+
+| Scenario | GitHub public extra USD/mo | GitHub private extra USD/mo |
+|----------|---------------------------:|----------------------------:|
+| 1× daily full-scale on Actions | **$0** (under assumed 2,000 min allowance) | **$0** (under assumed 3,000 min) |
+| 2× daily | **$0** | **$0** |
+
+Railway placeholder for 136.9 min/mo: **~$0.02** (see `PricingAssumptions`).
+
+Do **not** compare to the earlier **41-job / 1-family** sample — that was a different scope.
+
+## Validation benchmark (existing catalog) — **not executed**
+
+No verified read-only account was available (`JOBREADY_AUDIT_READONLY_URL` / `JOB_READY_DATABASE_URL` unset in this environment).
+
+When configured in a **private** environment only:
 
 ```shell
 python codequest_jobs/validation_benchmark.py --limit 25
@@ -41,45 +78,23 @@ python codequest_jobs/validation_benchmark.py --limit 100
 python codequest_jobs/validation_benchmark.py --limit 200
 ```
 
-Expected metrics: selected/checked/active/expired/inconclusive/unsupported counts, per-source breakdown, elapsed time, sec/job, and projected seconds for 1,000 and 5,000 jobs (linear extrapolation from measured checked count).
+Expected outputs: `BENCH_VALIDATE` counts-only lines; no job URLs in stdout; no catalog writes.
 
-## Cost projections (assumptions — rates not verified)
+## Fixes applied before trusting reports
 
-Measured collection duration used for math: **12s per run** (midpoint of the two local runs). Validation seconds use **placeholders** until live read-only runs exist.
+1. **Source completion:** `sources_completed` now reflects per-source health (`ok` / `partial_errors` / `zero_results` / `failed`), not merely the requested source list.
+2. **Railway cost:** Removed erroneous extra `× 30` on monthly minutes in `railway_cost_usd()`.
+3. **GitHub cost lines:** `github_cost_usd(..., pricing=PricingAssumptions())` wired in `build_report()`.
 
-| Scenario | Monthly minutes (approx.) | GitHub public extra USD* | GitHub private extra USD* | Railway cron USD* |
-|----------|---------------------------|--------------------------|---------------------------|-------------------|
-| Collection 1×/day | 6 | $0 (within 2,000 min allowance) | $0 (within 3,000 min allowance) | ~$0.01 |
-| Collection 2×/day | 12 | $0 | $0 | ~$0.02 |
-| Collection 4×/day | 24 | $0 | $0 | ~$0.03 |
-| Validation limit 25/day | TBD | TBD | TBD | TBD |
-| Validation limit 100/day | TBD | TBD | TBD | TBD |
-| Validation limit 200/day | TBD | TBD | TBD | TBD |
+## Limitations and errors
 
-\*Assumes GitHub-hosted Linux minutes at **$0.008/min** beyond included free minutes (2,000 public / 3,000 private per assumptions in `cost_calculator.py`). Railway row assumes **1 vCPU + 1 GB** at placeholder rates in `PricingAssumptions` — **not verified** against current Railway pricing.
+- **429 / proxy blocks** appear in dependency logs; benchmark `source_error_count` may be **0** while stderr shows JobSpy errors — improve by routing JobSpy failures into `errors` in a follow-up.
+- **Foundit / Google** zero yield may reflect source availability, query mismatch, or blocking — not distinguished beyond `zero_results` status.
+- **Local IP** vs **GitHub Actions IP** will change yield and block rates; re-measure on the target runner before scheduling.
+- **Validation timings** and production catalog counts remain **untested** here.
 
-Use `python -c` with `cost_calculator.project_costs(...)` after you have measured validation seconds to refresh this table.
+## Security
 
-## Recommendation
-
-| Workload | Suggested platform | Rationale |
-|----------|-------------------|-----------|
-| **Daily fresh collection** | **Railway Cron** (private network to catalog writer) | Keeps scraper secrets and job payloads off public GitHub logs; long-running fetches fit a container better than burning Actions minutes at scale. |
-| **Repeated link validation** | **Railway Cron or private runner** with read-only DB URL | Needs catalog access GitHub public runners should not have; validation benchmark explicitly blocks `GITHUB_ACTIONS`. |
-| **Regression / synthetic proof** | **GitHub Actions public pilot** (`jobready-public-pilot.yml`) | Already proves 696 tests on disposable Postgres without production credentials. |
-| **Bounded live scrape metrics** | **Manual `jobready-live-benchmark.yml`** | Useful for yield tuning with tiny caps; not for full catalog ingestion. |
-
-**Cheapest reliable production pattern:** private Railway cron for collection + validation against private Postgres, public repo limited to manual synthetic pilot and optional tiny live collection benchmarks—**never** store production DB URLs in GitHub Secrets on a public repo.
-
-## Security notes
-
-- Collection isolation rejects catalog/production DB env vars before scraping.
-- Validation wrapper refuses GitHub-hosted runners.
-- Audit extensions cap `--limit` at **200** and support `--counts-only` summaries without per-row stdout.
-- Inconclusive probe results remain inconclusive (never promoted to confirmed expired) via existing `audit_row` semantics.
-
-## Outstanding risks
-
-- Live scrapers can still fail or rate-limit unpredictably; benchmark defaults are small but not zero network risk.
-- GitHub Actions logs depend on dependency log levels; benchmark runner elevates common HTTP loggers to WARNING—review each new dependency.
-- Cost table is illustrative until validation timings and current vendor pricing are measured.
+- No Railway/production credentials loaded for collection.
+- Detailed job JSON stays under `benchmark_local_reports/` (gitignored).
+- Public logs should use `quiet_public_logs()` + `BENCH_*` lines only (stderr may still show dependency ERROR lines until JobSpy logging is fully suppressed).

@@ -124,6 +124,11 @@ class CostCalculatorTests(unittest.TestCase):
         costs = project_costs(collection_seconds=120.0, validation_seconds_by_limit={25: 30.0})
         self.assertFalse(costs["collection"]["1x_daily"]["github_public"]["rates_verified"])
 
+    def test_railway_monthly_cost_does_not_double_count_days(self):
+        costs = project_costs(collection_seconds=3600.0, validation_seconds_by_limit={})
+        railway = costs["collection"]["1x_daily"]["railway_cron"]
+        self.assertLess(railway["estimated_usd_assumption"], 5.0)
+
 
 class LiveCollectionReportTests(unittest.TestCase):
     def test_sanitize_errors_strips_urls(self):
@@ -135,7 +140,10 @@ class LiveCollectionReportTests(unittest.TestCase):
             per_source = {"naukri": 2, "indeed": 1}
             sources_attempted = ["naukri", "indeed"]
             errors = []
-            source_health = {"naukri": {"errors": []}, "indeed": {"errors": ["x"]}}
+            source_health = {
+                "naukri": {"calls": 2, "call_failures": 0, "succeeded": True, "failed": False, "jobs_returned": 2, "errors": []},
+                "indeed": {"calls": 2, "call_failures": 1, "succeeded": True, "failed": False, "jobs_returned": 1, "errors": ["indeed:timeout"]},
+            }
 
         report = build_report(
             sources="naukri,indeed",
@@ -151,6 +159,8 @@ class LiveCollectionReportTests(unittest.TestCase):
         )
         self.assertEqual(report["jobs_unique_after_dedupe"], 2)
         self.assertFalse(report["production_database_accessed"])
+        self.assertIn("naukri", report["sources_completed"])
+        self.assertNotIn("indeed", report["sources_failed"])
 
 
 if __name__ == "__main__":
